@@ -866,13 +866,62 @@ export function apply(ctx, config) {
     },
   })
 
-  tool({
+  /**
+   * ⭐⭐ 2026-10-25 新增：**把视频拆成图**（使用者问「为什么没有画面」）。
+   *
+   * 以前这一环整个不存在：插件明文「不看画面」，而 forward-pick.py 落盘时
+   * 连封面 / 视频地址都丢了 ⇒ 后面想抽帧也没料。现在两条都补上：
+   *   · 封面：抖音自己抽的那一帧，零依赖，永远拿得到；
+   *   · 真帧：下 mp4 + ffmpeg 等距离切（ffmpeg 用 venv 里的 imageio-ffmpeg，会自动装）。
+   *
+   * ⚠️ 图片要真的进模型，还差一步**模型声明**：这条 provider 的模型条目必须有
+   *    `inputModalities: ['text','image']`，否则 DSH 侧会把图片拦掉（read_image 会直接报
+   *    "model does not declare image input"）。实测百炼那条 `deepseek-v4.1-flash`
+   *    **本身吃图**（4x4 红图探针 200 + image_tokens=184），缺的只是声明。
+   */
+  toolWithImages({
+    name: 'douyin_frames',
+    description: '⭐⭐ 把一条视频拆成图：封面 + 等距离 N 帧（默认 3 帧、宽 640）。'
+      + '**图片会随结果一起给你（直接看得到）**，同时也给文件路径。'
+      + '只能在最新一轮候选清单里挑（先跑 douyin_forward / douyin_prescreen）；'
+      + '第一次用会装 ffmpeg（约 31MB，一次装好长期用）。',
+    parameters: {
+      aweme_id: { type: 'string', description: '作品 ID（要在最新一轮候选清单里）' },
+      frames: { type: 'number', description: '抽几帧（默认 3，最多 12；0 = 只要封面）' },
+      width: { type: 'number', description: '输出宽度（默认 640，等比缩放）' },
+    },
+    async execute(args = {}) {
+      const id = String(args.aweme_id || '').trim()
+      if (!id) return { ok: false, error: '缺 aweme_id', hint: '先从 douyin_forward / douyin_prescreen 的 list[] 里挑一个' }
+      const n = args.frames === undefined ? 3 : Math.max(0, Math.min(Number(args.frames) || 0, 12))
+      const w = Math.max(120, Math.min(Number(args.width) || 640, 1600))
+      const r = runPy('frames.py', ['--aweme', id, '--frames', String(n), '--width', String(w)], { timeout: 600_000 })
+      const got = pickJson(r.stdout)
+      if (!got) return { ok: false, error: '抽帧脚本没给出结果', stderr: String(r.stderr || '').slice(0, 500) }
+      if (got.ok === false) return got
+      const files = (Array.isArray(got.frames) ? got.frames : []).filter((f) => f && f.path)
+      const { refs, note } = await admitImages(files)
+      return {
+        ...got,
+        frames: files.map((f, i) => ({ idx: f.idx, kind: f.kind, at_s: f.at_s, path: f.path, bytes: f.bytes, img_index: i })),
+        images_attached: refs.length,
+        image_index_note: 'img_index 对应本次结果里第几张图（从 0 数；附加顺序和 frames 一样）',
+        ...(note ? { image_note: note } : {}),
+        ...(refs.length ? {} : { hint: '图没随结果过来 ⇒ 让使用者把 provider 配置里这个模型加上 inputModalities: [text, image]' }),
+        __images: refs,
+      }
+    },
+  })
+
+  toolWithImages({
     name: 'douyin_prescreen',
-    description: '⭐ 一轮的主入口：取候选 → 打分 →（可选）给前几条拉高赞评论 → 返回「判断用的证据包」。'
-      + '**判断就基于返回的 list[].evidence，别自己再逐条搜。**',
+    description: '⭐ 一轮的主入口：取候选 → 打分 →（可选）拉高赞评论 / **抽画面** → 返回「判断用的证据包」。'
+      + '**判断就基于返回的 list[].evidence 和 list[].frames（图片会直接给你看），别自己再逐条搜。**',
     parameters: {
       top: { type: 'number', description: '返回前几条（默认 10，最多 30）' },
       with_comments: { type: 'number', description: '给前 N 条拉评论（默认 5；0 = 不拉）' },
+      frames: { type: 'number', description: '给前 N 条抽帧（默认 0 = 不抽；每条约 3 张图，费 token，建议 ≤3）' },
+      frame_count: { type: 'number', description: '每条抽几帧（默认 3，最多 6；0 = 只要封面）' },
     },
     async execute(args = {}) {
       const top = Math.max(1, Math.min(Number(args.top) || 10, 30))
@@ -884,6 +933,13 @@ export function apply(ctx, config) {
       try { picked = JSON.parse(readFileSync(join(stateDir, 'forward-pick.json'), 'utf8')) } catch { picked = {} }
       const rows = (Array.isArray(picked.rows) ? picked.rows : []).slice(0, top)
       if (!rows.length) return { ok: true, kept: 0, note: '推荐流这轮没返回候选，稍后再试' }
+      /**
+       * ⭐ 2026-10-25：画面开关。默认**不抽**（每张图都要花 token），
+       *    调用方说要几条才抽几条 —— 通常是"快定稿的那几条"。
+       */
+      const withFrames = Math.max(0, Math.min(Number.isFinite(Number(args.frames)) ? Number(args.frames) : 0, rows.length, 10))
+      const frameCount = Math.max(0, Math.min(Number.isFinite(Number(args.frame_count)) ? Number(args.frame_count) : 3, 6))
+      const allFrames = []
       const list = []
       for (let i = 0; i < rows.length; i++) {
         const x = rows[i]
@@ -905,9 +961,32 @@ export function apply(ctx, config) {
             ? lines.slice(0, 5).map((s) => s.replace(/^\s+/, '').replace(/^cid=\d+\s+/, '').slice(0, 160))
             : ['（没拉到评论）']
         }
+        // ⭐ 画面：前 withFrames 条各抽 frameCount 帧（图片随结果一起进模型）
+        if (i < withFrames) {
+          const f = runPy('frames.py', ['--aweme', String(x.aweme_id), '--frames', String(frameCount)], { timeout: 300_000 })
+          const gotF = pickJson(f.stdout)
+          if (gotF && gotF.ok && Array.isArray(gotF.frames) && gotF.frames.length) {
+            item.frames = gotF.frames.map((fr) => ({
+              kind: fr.kind, at_s: fr.at_s, path: fr.path, bytes: fr.bytes, img_index: allFrames.push(fr) - 1,
+            }))
+            if (gotF.warnings && gotF.warnings.length) item.frames_warnings = gotF.warnings
+          } else {
+            item.frames_note = '抽帧没成功：' + String((gotF && gotF.error) || f.stderr || '').slice(0, 160)
+          }
+        }
         list.push(item)
       }
-      return { ok: true, kept: list.length, sources: picked.meta || [], dropped: picked.dropped || {}, thresholds: picked.thresholds || {}, list }
+      const admitted = await admitImages(allFrames)
+      return {
+        ok: true, kept: list.length, sources: picked.meta || [], dropped: picked.dropped || {}, thresholds: picked.thresholds || {},
+        frames: {
+          items: withFrames, each: frameCount, total: allFrames.length, attached: admitted.refs.length,
+          ...(admitted.note ? { note: admitted.note } : {}),
+        },
+        image_index_note: 'list[].frames[].img_index 指本次结果里第几张图（从 0 数），图按 frames 出现顺序附加',
+        list,
+        __images: admitted.refs,
+      }
     },
   })
 

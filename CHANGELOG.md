@@ -5,6 +5,35 @@
 
 ---
 
+## 0.5.0 — 2026-10-25（进行中）
+
+### 🎬 画面能看了：封面 + 抽帧，图直接进模型（使用者问「为什么没有画面」）
+
+以前这条链路的判断**只有文字**（文案 / 互动数 / 评论）—— 因为两件事同时成立：
+
+1. `forward-pick.py` 落盘时把 `cover` / `play_addr` **丢掉了** ⇒ 后面想抽帧也没料；
+2. 模型条目没声明吃图，DSH 侧会把图片整段拦掉（连内置 `read_image` 都直接报
+   `model "…" does not declare image input`）。
+
+现在两条都补上了：
+
+- **`tools/frames.py`**（新）：封面（零依赖，抖音自己抽的那帧）+ 等距离 N 帧
+  （下载 mp4 后用 ffmpeg 切；ffmpeg 走 venv 里的 `imageio-ffmpeg`，没有就自动装，约 31MB）。
+  输出 `<家>/frames/<aweme_id>/`，`--cover-only` / `--clean` / `--list` 都在。
+- **`douyin_frames`**（新工具，DSH 和 MCP 两侧都有）：图会**随工具结果一起进模型**
+  （DSH 侧走 attachments 落库 + `{type:'image'}` 渲染块；MCP 侧走标准 image content），
+  同时给文件路径兜底。
+- `douyin_prescreen` 多了 `frames:` / `frame_count:`（默认 0 = 不抽，抽帧费 token，按需开）。
+- 模型声明补上 `input: [text, image]`（桌面 profile + 值班轮的 overlay 会自动跟着抄）。
+  实测这条路**本身吃图**：4×4 红图探针打百炼那条 = HTTP 200 + `image_tokens: 184`。
+  本轮实拍验证：`7685625935252507944` 抽出封面 + 3 帧，模型能直接描述画面内容。
+- 文案/提示词的禁令一起放开（README / AGENTS / `prompts/duty.md`）：
+  **不做** OCR / ASR 不变，但"不做抽帧"改成"`douyin_frames` 抽就行，别自己另起炉灶"。
+
+> 仍然**不做** OCR（不认字）和 ASR（不听声）—— 画面靠抽帧看，字和声不碰。
+
+---
+
 ## 0.4.0 — 2026-10-24
 
 ### 🐟 桌宠：她住进右下角（使用者拍板：窗口宠 + 纸娃娃分层）

@@ -228,6 +228,78 @@ const TOOLS = [
     },
   },
   {
+    /**
+     * ⭐⭐ 2026-10-25 新增（使用者问「为什么没有画面」）：
+     *    以前这一轮**只有文字**（文案 / 互动数 / 评论），画面压根没进链路 ——
+     *    forward-pick.py 落盘时连封面和 play_addr 都丢了。
+     *    现在：封面（零依赖）+ ffmpeg 等距离抽帧，**图直接作为 MCP image 内容回去**。
+     *
+     * ⚠️ 能不能"看见"还取决于两件事，缺一不可：
+     *   ① 这条 provider 的模型条目要声明吃图（`input: [text, image]`）——
+     *      百炼这条 `deepseek-v4.1-flash` 实测本身吃图（4x4 红图探针：200 + image_tokens=184）；
+     *   ② 客户端（DSH）要把 MCP 的 image 块落成自己的附件再喂给模型。
+     *   任一条不成立时，这个工具**至少还给你文件路径**，调用方可以自己想办法。
+     */
+    name: 'douyin_frames',
+    title: '刷抖音 · 把视频拆成图',
+    description: '把一条视频拆成图：封面 + 等距离 N 帧（默认 3 帧 / 宽 640）。图片会随结果直接给你看，'
+      + '文件路径也一并给。只能在最新一轮候选清单里挑（先跑 douyin_forward）。第一次用会装 ffmpeg（约 31MB）。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        aweme_id: { type: 'string', description: '作品 ID（要在最新一轮候选清单里）' },
+        frames: { type: 'number', description: '抽几帧（默认 3，最多 12；0 = 只要封面）' },
+        width: { type: 'number', description: '输出宽度（默认 640）' },
+      },
+      required: ['aweme_id'],
+      additionalProperties: false,
+    },
+    handler: (args) => {
+      const bad = needLogin() || needSetup()
+      if (bad) return bad
+      const id = String(args?.aweme_id || '').trim()
+      if (!id) return { ok: false, error: '缺 aweme_id', hint: '先从 douyin_forward 的 list[] 里挑一个' }
+      const n = args?.frames === undefined ? 3 : Math.max(0, Math.min(Number(args.frames) || 0, 12))
+      const w = Math.max(120, Math.min(Number(args.width) || 640, 1600))
+      const r = runPy('frames.py', ['--aweme', id, '--frames', String(n), '--width', String(w)], 600_000)
+      const got = pickJson(r.stdout)
+      if (!got) return { ok: false, error: '抽帧脚本没给出结果', stderr: String(r.stderr || '').slice(0, 500) }
+      if (got.ok === false) return got
+      const files = (Array.isArray(got.frames) ? got.frames : []).filter((f) => f && f.path)
+      const content = [{
+        type: 'text',
+        text: JSON.stringify({
+          ok: true,
+          aweme_id: got.aweme_id,
+          dir: got.dir,
+          desc: got.desc,
+          author: got.author,
+          duration_s: got.duration_s,
+          frames: files.map((f) => ({ idx: f.idx, kind: f.kind, at_s: f.at_s, path: f.path, bytes: f.bytes })),
+          attached: 0,      // 下面补
+          warnings: got.warnings || [],
+        }, null, 1),
+      }]
+      let attached = 0
+      for (const f of files) {
+        try {
+          const buf = readFileSync(f.path)
+          content.push({ type: 'image', data: buf.toString('base64'), mimeType: 'image/jpeg' })
+          attached++
+        } catch (e) {
+          content[0].text = content[0].text.replace('"attached": 0', `"attach_error_for_${f.idx}": ${JSON.stringify(String(e?.message ?? e))}`)
+        }
+      }
+      // 别让 JSON 里那个占位数字留在最终文本里
+      try {
+        const obj = JSON.parse(content[0].text)
+        obj.attached = attached
+        content[0].text = JSON.stringify(obj, null, 1)
+      } catch { /* 文本坏了也不影响图 */ }
+      return { ok: true, __content: content }
+    },
+  },
+  {
     name: 'douyin_comments',
     title: '刷抖音 · 读评论',
     description: '取一个作品下的评论（签名的只读接口，带楼中楼）。判断「好不好玩」的主要文本依据。',
@@ -613,6 +685,17 @@ const fail = (id, code, message, data) => send({ jsonrpc: '2.0', id, error: { co
 
 /** 工具结果统一包成 MCP content */
 const asContent = (value) => {
+  /**
+   * ⭐⭐ 2026-10-25：有的工具要**直接回图**（douyin_frames）——
+   *    那就把 MCP content 数组放在 `__content` 里，这里原样透传（不再 JSON 化）。
+   *    MCP 的图片是 base64 + mimeType（见规范），和文本块可以混在同一个 content 数组里。
+   */
+  if (value && typeof value === 'object' && Array.isArray(value.__content)) {
+    return {
+      content: value.__content,
+      isError: value.ok === false ? true : undefined,
+    }
+  }
   const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2)
   return {
     content: [{ type: 'text', text }],
