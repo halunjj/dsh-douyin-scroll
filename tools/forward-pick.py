@@ -3,9 +3,11 @@
 """
 tools/forward-pick.py —— 刷一轮：拉候选 → 打分 → 生成「转发给我」的清单
 ============================================================================
-只读、**不签名**、不碰写接口。判断依据全部来自 JSON 字段：
-desc / tags / author / create_time / duration / digg·comment·collect·share / 高赞评论。
-不看画面、不做 ASR/OCR、不读视频。
+只读、**不签名**、不碰写接口。判断依据来自 JSON 字段：
+desc / tags / author / create_time / duration / digg·comment·collect·share / 高赞评论，
+外加**画面**（2026-10-25 起）：cover_url（抖音自己那帧封面）+ play_url（真视频地址）。
+⚠️ 这两样以前在**落盘时就被丢掉**，所以后面 tools/frames.py 想抽帧也没料 —— 别再删。
+不做 ASR/OCR（听声、认字），画面走 frames.py 抽帧这条路。
 
 用法:
   python tools/forward-pick.py            # 拉 feed 3 页 + 热榜，出清单
@@ -74,6 +76,35 @@ def stat(a, k):
         return int(s.get(k) or 0)
     except Exception:
         return 0
+
+
+def pick_url(d, *keys):
+    """
+    从 `{url_list: [...]}` 这种形状里取第一条 http(s) 地址（按 keys 顺序试，命中就返回）。
+    ⚠️ 抖音同一份数据里字段名会变（origin_cover / cover / dynamic_cover；play_addr /
+       play_addr_265 / download_addr），所以按顺序试而不是只认一个。
+    """
+    if not isinstance(d, dict):
+        return ""
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, dict):
+            for u in (v.get("url_list") or []):
+                if isinstance(u, str) and u.startswith("http"):
+                    return u
+        elif isinstance(v, str) and v.startswith("http"):
+            return v
+    return ""
+
+
+def cover_of(a):
+    """封面：抖音自己抽的那一帧。注意选 origin_cover（原图），cover 常被裁过。"""
+    return pick_url(a.get("video") or {}, "origin_cover", "cover", "dynamic_cover")
+
+
+def play_of(a):
+    """真视频地址：抽帧用。download_addr 通常和 play_addr 同一个文件。"""
+    return pick_url(a.get("video") or {}, "play_addr", "play_addr_h264", "download_addr", "play_addr_265")
 
 
 def fmts(n):
@@ -199,6 +230,9 @@ def main():
             "share_desc": (si.get("share_link_desc") or "").replace("%s", official).strip(),
             # 网页地址（能在浏览器打开，但不是分享链接）
             "web_url": "%s/video/%s" % (BASE, aid),
+            # ⭐⭐ 2026-10-25：画面入口（tools/frames.py 只认这两样；删了就等于又没图看）
+            "cover_url": cover_of(a),
+            "play_url": play_of(a),
         })
 
     rows.sort(key=lambda r: -r["score"])

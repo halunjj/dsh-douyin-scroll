@@ -24,7 +24,7 @@ const z = hostDeps.z
 const defineTool = hostDeps.defineTool
 import { spawn, spawnSync } from 'node:child_process'
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { join, dirname } from 'node:path'
+import { join, dirname, basename } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WINDOWS, stateDirOf, readJson, writeJson, ensureHomeFiles, ensureCharter, charterPath, inWindow, dayKey, redactCookie } from './lib/state.mjs'
 import { saveCookie, readCookie, hasCredential, credentialInfo, clearCredential, cookiePath } from './lib/credential.mjs'
@@ -552,6 +552,71 @@ export function apply(ctx, config) {
     output: textOutput,
     async execute(args, exec) { return safe(await spec.execute(args, exec)) },
   }))
+
+  /**
+   * ⭐⭐ 2026-10-25：**带图的工具** —— 工具结果里除了文字还能带图片。
+   *
+   * 为什么以前做不到：所有工具都硬套 `output: textOutput`（textOutput.render 只出 text 块）
+   * ⇒ 就算抽了帧，模型手里也只有一串**路径字符串**，等于还是"没有画面"。
+   *
+   * DSH 的图片不是 base64，是 **attachment 引用**：得先 `attachments.saveImages()` 把它落库，
+   * render 里再出 `{ type: 'image', attachment: ref }`（`dsh-tool-fs` 的 read_image 就是这么干的，
+   * 见 asar 里 `imageReadContent()`）。
+   *
+   * 约定：execute 返回的对象里放一个 `__images: [ref, ...]`，render 把它摊成 image 块，
+   *       文字部分**不含** `__images`（别把附件 id 当正文喂给模型）。
+   */
+  const imageOutput = {
+    schema: { type: 'object', properties: {}, additionalProperties: true },
+    render: (_args, value) => {
+      const parts = []
+      const v = value && typeof value === 'object' ? value : null
+      if (v) {
+        const { __images, ...rest } = v
+        parts.push({ type: 'text', text: JSON.stringify(rest, null, 2) })
+      } else {
+        parts.push({ type: 'text', text: typeof value === 'string' ? value : String(value) })
+      }
+      for (const img of (v && Array.isArray(v.__images) ? v.__images : [])) {
+        if (img && img.attachmentId) parts.push({ type: 'image', attachment: img })
+      }
+      return parts
+    },
+  }
+  const toolWithImages = (spec) => ctx.tools.register(defineTool({
+    ...spec,
+    output: imageOutput,
+    async execute(args, exec) { return safe(await spec.execute(args, exec)) },
+  }))
+
+  /**
+   * 把抽出来的帧图**落库成附件**，返回 DSH 能当图片使的引用。
+   * ⚠️ 拿不到 attachments 服务（比如某个精简 profile）就**退化成只给路径** ——
+   *    调用方还能自己 `read_image`，不要让整个工具失败。
+   */
+  const admitImages = async (files) => {
+    const att = ctx.get('attachments')
+    if (!att || typeof att.saveImages !== 'function') {
+      return { refs: [], note: '这个 profile 没挂 attachments 服务 ⇒ 只给文件路径（可以用 read_image 自己看）' }
+    }
+    const refs = []
+    const failed = []
+    for (const f of (files || [])) {
+      if (!f || !f.path) continue
+      try {
+        const buf = readFileSync(f.path)
+        const [ref] = await att.saveImages([{ data: new Uint8Array(buf), mediaType: 'image/jpeg', name: basename(f.path) }])
+        if (ref && ref.attachmentId) refs.push(ref)
+        else failed.push(f.path)
+      } catch (e) {
+        failed.push(`${f.path}（${e?.message ?? e}）`)
+      }
+    }
+    return {
+      refs,
+      note: failed.length ? `有 ${failed.length} 张没能入库：${failed.join('；')}` : '',
+    }
+  }
 
   /**
    * 跑插件自带的 node 脚本（tools/*.mjs），返回 {status, stdout, stderr} —— 永不抛

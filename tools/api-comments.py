@@ -57,6 +57,36 @@ def sign(rel):
     return json.loads(out[i:out.rfind("}") + 1])
 
 
+def dom_fallback(aweme):
+    """签名器用不了时改走「评论区 DOM」（comment-read-dom.mjs）——页面上读，不需要签名。"""
+    rel = os.path.join(PLUGIN, "tools", "comment-read-dom.mjs")
+    print("[dom] 签名器不可用 ⇒ 改走评论区 DOM（按最新渲染，能翻到刚发的评论）", flush=True)
+    try:
+        p = subprocess.run([NODE, rel, "--aweme", str(aweme)], capture_output=True, cwd=PLUGIN, timeout=280)
+    except subprocess.TimeoutExpired:
+        print(json.dumps({"ok": False, "err": "comment-read-dom.mjs 超时"}, ensure_ascii=False))
+        return 1
+    out = p.stdout.decode("utf-8", "replace")
+    err = p.stderr.decode("utf-8", "replace").strip()
+    i = out.find("{")
+    if i < 0:
+        print(json.dumps({"ok": False, "err": (out or err)[-300:]}, ensure_ascii=False))
+        return 1
+    try:
+        j = json.loads(out[i:out.rfind("}") + 1])
+    except Exception as e:
+        print(json.dumps({"ok": False, "err": "DOM 结果解析失败: %s" % e}, ensure_ascii=False))
+        return 1
+    if not j.get("ok"):
+        print(json.dumps({"ok": False, "err": j.get("error") or "DOM 读取失败", "via": "dom"}, ensure_ascii=False))
+        return 1
+    items = j.get("items") or []
+    print("via=dom me=%s 抓到=%s 条" % (j.get("me_nick") or "", j.get("total_scraped")))
+    for it in items:
+        print("  %s%s: %s" % ("[我] " if it.get("mine") else "", it.get("nick") or "", (it.get("text") or "")[:110]))
+    return 0
+
+
 def main():
     aweme = sys.argv[1] if len(sys.argv) > 1 else "7698980229549139835"
     seen = set()
@@ -64,9 +94,15 @@ def main():
     for page in range(4):
         rel = "/aweme/v1/web/comment/list/?" + qs({**COMMON, "aweme_id": aweme, "count": 20, "cursor": page * 20, "item_type": 0})
         s = sign(rel)
-        if s.get("err"):
-            print(json.dumps({"ok": False, "err": s["err"]}, ensure_ascii=False))
-            return 1
+        if s.get("err") or not s.get("signedUrl"):
+            # 🔴 2026-10-25：签名器不可用时别再 KeyError 崩掉（三轮值班都是这么死的：
+            #    `u = s["signedUrl"]` → KeyError，整条路交不出任何评论文本）。
+            #    内置签名器要 $DOUYIN_HOME/signer/{node_modules/jsdom, sdk/×7}，
+            #    而插件里**没有任何代码**会去铺它们；就算铺了，作者注释里那句
+            #    「bdms 已被打过补丁（改写 URL 后回调 window.__capUrl）」的那个补丁也没随包发，
+            #    实测官方 bdms 里连 'a_bogus' 这个字面量都没有 ⇒ 抓不到签名 URL。
+            #    ⇒ 退到「评论区 DOM」：页面上读，不需要签名，而且按最新排序。
+            return dom_fallback(aweme)
         u = s["signedUrl"]
         if not u.startswith("http"):
             u = "https://www.douyin.com" + u
