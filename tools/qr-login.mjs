@@ -85,26 +85,6 @@ function profileInUse() {
   } catch { return [] }
 }
 
-/**
- * 已经在跑的那个实例会把调试端口写在命令行里 ⇒ 直接读出来复用。
- * ⭐ 只认**可见登录窗口**那一段端口（≥9374）；9334–9373 是后台无头浏览器的，
- *    复用它等于对着一个没有窗口的浏览器截二维码，用户永远扫不到。
- */
-function runningCdpPort() {
-  try {
-    const out = execFileSync('powershell.exe', ['-NoProfile', '-Command',
-      `Get-CimInstance Win32_Process -Filter "${PROC_FILTER}" | ` +
-      `Where-Object { $_.CommandLine -like '*${MARK}*' } | ` +
-      `ForEach-Object { if ($_.CommandLine -match '--remote-debugging-port=(\\d+)') { $Matches[1] } }`],
-      { encoding: 'utf8', timeout: 15000 })
-    for (const s of String(out || '').split(/\r?\n/)) {
-      const p = Number(String(s).trim())
-      if (p >= 9374 && p < 9414) return p
-    }
-    return 0
-  } catch { return 0 }
-}
-
 /** 关掉占着 profile 的浏览器（只在用户明确要求时用） */
 function closeProfileChrome() {
   try {
@@ -210,15 +190,17 @@ async function runStart() {
 
   // ⭐ 先看看这个 profile 是不是已经有人占着
   const busy = profileInUse()
-  // ⭐ 已经开着的**可见**登录窗口会把端口写在命令行里 —— 读出来复用，
-  //    否则 findFreePort() 会挑一个没人监听的端口，然后同一个 profile 起第二个
-  //    浏览器（新进程立刻交给老实例并退出），现象就是「登录用的浏览器还没开」。
+  // ⭐ 已经开着的**可见**登录窗口：用现成的 discoverQrPort() 把端口找回来复用
+  //    （它先看 runtime.json 里记的，再扫 9374–9413；那段端口天然避开后台无头的
+  //     9334–9373，所以不会连到一个没有窗口的浏览器上）。
+  //    不加这一步的话：findFreePort() 会挑一个没人监听的端口，然后同一个 profile
+  //    起第二个浏览器（新进程立刻交给老实例并退出），现象就是
+  //    「登录用的浏览器还没开」—— 面板点多少次都一样。
   let alreadyOpen = false
-  if (!PORT) PORT = runningCdpPort()
+  if (!PORT) PORT = await discoverQrPort()
   if (busy.length) {
     // 已经有登录窗口开着（端口能连上）⇒ 直接复用，把窗口顶到前面
-    let alive = false
-    try { alive = (await fetch(`${cdpUrl()}/json/version`)).ok } catch { alive = false }
+    let alive = await loginBrowserUp()
     if (alive) {
       // ⭐ 复用：不另起浏览器，但**继续往下走** —— 该点的「登录」还点，
       //    该截的二维码还截。老代码这里直接 return，用户看到的还是上一次那个
@@ -536,13 +518,16 @@ if (cmd === 'watch') {
 }
 
 if (cmd === 'close') {
-  try {
-    execFileSync('powershell.exe', ['-NoProfile', '-Command',
-      `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | ` +
-      `Where-Object { $_.CommandLine -like '*chrome-profile*' } | ` +
-      `ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`],
-      { encoding: 'utf8', timeout: 20000 })
-    console.log(JSON.stringify({ ok: true, closed: true }, null, 2))
-  } catch (e) { console.log(JSON.stringify({ ok: false, error: String(e?.message ?? e) }, null, 2)) }
+  // ⭐ 这里原先又写了一遍 `Name='chrome.exe'`（第四处）——
+  //    面板「先关掉后台浏览器，再出二维码」和 /login/qr?force=1 都走这条路，
+  //    浏览器是 Edge 时它杀不掉任何东西 ⇒ 无头浏览器一直占着 profile ⇒
+  //    「扫码登录」永远返回 profile_in_use，用户点多少次都出不来二维码。
+  //    统一走 closeProfileChrome()（进程名跟着 findBrowser()）。
+  const ok = closeProfileChrome()
+  // 顺手把"记住的登录端口"作废，免得 discoverQrPort() 去连一个已经关掉的窗口
+  PORT = 0
+  saveQrPort()
+  console.log(JSON.stringify({ ok, closed: ok }, null, 2))
+  if (!ok) process.exitCode = 2
 }
 
