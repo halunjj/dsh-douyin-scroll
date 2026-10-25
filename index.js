@@ -1873,8 +1873,25 @@ export function apply(ctx, config) {
   const resolveDsh = () => {
     // 运行时脚本用哪个解释器：有独立 node 就用它（见上面那段实测说明）
     const jsRunner = () => nodeExe() || process.execPath
+    /**
+     * 🔴🔴 2026-10-25 修的真 bug（本机必现，每一轮都 code=1）：
+     *    `app.asar` **里面**的入口普通 node 读不进去 —— asar 是 Electron 自己的虚拟
+     *    文件系统，只有 **Electron 的 node 模式**认它：
+     *      $ node ".../app.asar/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js" --version
+     *      Error: Cannot find module '…\app.asar\…\cli.js'      ← MODULE_NOT_FOUND（退出码 1）
+     *      $ ELECTRON_RUN_AS_NODE=1 "DeepSeek Harness.exe" <同一个路径> --version
+     *      0.2.1-rc.2                                            ← ✓（退出码 0）
+     *    实测日期 2026-10-25，DSH 0.2.1-rc.2 / Electron 桌面版。
+     *    ⇒ 入口在 asar 里 ⇒ 用 Electron 可执行文件当解释器（spawn 那一头会带上
+     *      ELECTRON_RUN_AS_NODE=1）；只有**真实存在的文件**才用独立 node。
+     */
+    const electronExe = process.versions.electron ? process.execPath : ''
+    const isAsarPath = (p) => /\.asar[\\/]/i.test(String(p))
+    const runnerFor = (p) => (isAsarPath(p) && electronExe)
+      ? { command: electronExe, args: [p], shell: false, electronNode: true }
+      : { command: jsRunner(), args: [p], shell: false }
     const explicit = String(cfg.dshBin || '').trim()
-    if (explicit && existsSync(explicit)) return { command: jsRunner(), args: [explicit], shell: false }
+    if (explicit && (existsSync(explicit) || (isAsarPath(explicit) && electronExe))) return runnerFor(explicit)
 
     /**
      * ⭐⭐ 2026-10-23 重写（起因：使用者反馈「总是显示找不到 dsh：桌面版多半不是 NPM 全局安装的」）
@@ -1949,31 +1966,46 @@ export function apply(ctx, config) {
      *       —— 这一步是给"没解 asar 的普通桌面安装"准备的。
      */
     const isAsar = (p) => /\.asar[\\/]/i.test(String(p))
-    const runnable = (p) => {
+    /**
+     * 🔴 2026-10-25 修的真 bug ②：`runnable` 原来是
+     *      `r.status === 0 || /\d+\.\d+\.\d+/.test(out)`
+     *    —— node 跑不起来时 stderr 最后一行就是 `Node.js v24.22.1`，
+     *    **正好被那个版本号正则匹配** ⇒ 一个根本读不进去的 asar 路径也被判成
+     *    「已验证可跑」，日志里还印一行自欺欺人的 ✓，然后每一轮都 code=1。
+     *    ⇒ 现在只认**退出码 0**，另外把"其实没跑起来"的几种字样也挡掉。
+     */
+    const runnable = (run) => {
       try {
-        const r = spawnSync(jsRunner(), [p, '--version'], { encoding: 'utf8', windowsHide: true, timeout: 25_000 })
+        const r = spawnSync(run.command, [...run.args, '--version'], {
+          encoding: 'utf8', windowsHide: true, timeout: 25_000,
+          env: pyEnv(run.electronNode ? { ELECTRON_RUN_AS_NODE: '1' } : {}),
+        })
         const out = `${r.stdout || ''}${r.stderr || ''}`
-        return r.status === 0 || /\d+\.\d+\.\d+/.test(out)
+        if (r.status !== 0) return false
+        if (/Cannot find module|MODULE_NOT_FOUND|ERR_MODULE_NOT_FOUND|unsupported Electron runtime fingerprint|^\s*Error:/m.test(out)) return false
+        return true
       } catch { return false }
     }
 
     // ① 真实存在（非 asar）的候选，直接返回
     for (const p of candidates) {
       if (!p || isAsar(p)) continue
-      try { if (existsSync(p)) return { command: jsRunner(), args: [p], shell: false } } catch { /* 下一个 */ }
+      try { if (existsSync(p)) return runnerFor(p) } catch { /* 下一个 */ }
     }
-    // ② asar 内的候选：真跑一次验证（Electron 宿主能跑）
+    // ② asar 内的候选：用 **Electron 的 node 模式**真跑一次验证（普通 node 必然读不进去）
     for (const p of candidates) {
       if (!p || !isAsar(p)) continue
-      if (runnable(p)) {
-        log(`dsh 入口（asar 内，已验证可跑）：${p}`)
-        return { command: jsRunner(), args: [p], shell: false }
+      const run = runnerFor(p)
+      if (runnable(run)) {
+        log(`dsh 入口（asar 内，Electron node 模式已验证可跑）：${p}`)
+        return run
       }
     }
     // ③ 最后再兜一遍：非 asar 但 existsSync 没命中的（权限/符号链接怪情况）
     for (const p of candidates) {
       if (!p || isAsar(p)) continue
-      if (runnable(p)) return { command: jsRunner(), args: [p], shell: false }
+      const run = runnerFor(p)
+      if (runnable(run)) return run
     }
 
     /**
@@ -2029,6 +2061,8 @@ export function apply(ctx, config) {
       '',
     )
     // ⭐ 让那一轮跟随桌面版当前选的模型（overlay 是最后叠加的一层 ⇒ 它赢）
+    /** 桌面版当前选的模型（provider/model）—— 下面"补 provider 插件"那一段要用 */
+    let deskPick = null
     try {
       const deskPatch = join(dirname(stateDir), 'profiles', 'desktop', 'cordis.patch.yml')
       if (existsSync(deskPatch)) {
@@ -2059,11 +2093,71 @@ export function apply(ctx, config) {
           if (provider && model) {
             yml.push('- id: agent-default-model', "  name: '@deepseek-ai/dsh-agent-default-model'", '  config:',
               `    provider: '${provider}'`, `    model: '${model}'`, ...(effort ? [`    reasoningEffort: '${effort}'`] : []), '')
+            deskPick = { provider, model }
             log(`overlay: 模型跟随桌面版 = ${provider} / ${model}`)
           }
         }
       }
     } catch (e) { log(`读桌面版模型配置失败（不影响跑）：${e?.message ?? e}`) }
+
+    /**
+     * ⭐⭐ 2026-10-25 修的真 bug ③：**桌面版选的 provider，headless 那一轮认不出来**。
+     *
+     * 实测（这台机器，DSH 0.2.1-rc.2）：上面那段"模型跟随桌面版"只抄了 provider 的**名字**，
+     * 没把**提供 adapter 的那个插件**带过来。headless 模板自己只挂 `dsh-llm-deepseek`，
+     * 而桌面版用的是 `@deepseek-ai/dsh-llm-pi-ai` 里的 `halunjj`（百炼）⇒ 每一轮刚起来就：
+     *      dsh: NO_ADAPTER: no adapter registered for provider "halunjj"
+     * 一句话都没说就退了（报告只能补占位）。
+     * ✅ 修法：照抄桌面版 profile 里**声明了 `providers:` 的那个条目**（id / name / config
+     *    整块），用 `- insert:` 写进 overlay —— overlay 是最后叠加的一层，插进来就等于
+     *    给这一轮补上 adapter。headless 那边已经有的插件不重复插。
+     */
+    try {
+      const want = String(deskPick?.provider || '')
+      if (want) {
+        const deskPatch = join(dirname(stateDir), 'profiles', 'desktop', 'cordis.patch.yml')
+        const dlines = existsSync(deskPatch) ? readFileSync(deskPatch, 'utf8').split(/\r?\n/) : []
+        let target = null
+        for (let i = 0; i < dlines.length; i++) {
+          const m = /^-\s+id:\s*(\S+)\s*(?:#.*)?$/.exec(dlines[i])
+          if (!m) continue
+          let end = dlines.length
+          for (let j = i + 1; j < dlines.length; j++) if (/^-\s+id:/.test(dlines[j])) { end = j; break }
+          const block = dlines.slice(i, end)
+          const body = block.join('\n')
+          if (!/^\s+providers:\s*$/m.test(body)) continue          // 只认声明 providers: 的那块
+          const re = new RegExp('^\\s+' + want.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ':\\s*$', 'm')
+          if (!re.test(body)) continue                             // 且里面得有我们要的那个 provider
+          const nameLine = block.find((l) => /^\s+name:\s*\S/.test(l))
+          const ci = block.findIndex((l) => /^\s+config:\s*$/.test(l))
+          if (!nameLine || ci < 0) continue
+          target = {
+            id: m[1],
+            name: String(nameLine).replace(/^\s+name:\s*/, '').replace(/^['"]|['"]$/g, '').trim(),
+            cfg: block.slice(ci),
+          }
+          break
+        }
+        if (!target) {
+          log(`⚠️ 桌面版用的 provider "${want}" 在桌面 profile 里找不到 providers: 声明 —— 这一轮可能报 NO_ADAPTER`)
+        } else {
+          // 这一轮自己（headless profile 的 bundles）已经有这个插件就别重复插
+          let already = false
+          try {
+            const hlPkg = join(dirname(stateDir), 'profiles', cfg.headlessProfile || 'headless', 'package.json')
+            already = readFileSync(hlPkg, 'utf8').includes(target.name)
+          } catch { /* 读不到就照插，重复插只会覆盖同名 id */ }
+          if (already) {
+            log(`overlay: provider 插件 ${target.id} 这一轮已经有了（不用插）`)
+          } else {
+            yml.push('- insert:', `    - id: ${target.id}`, `      name: '${target.name}'`)
+            for (const l of target.cfg) yml.push('    ' + l)       // 缩进 +4 折进 insert 项
+            yml.push('')
+            log(`overlay: 补上 provider 插件 ${target.id}（给 ${want} 提供 adapter）`)
+          }
+        }
+      }
+    } catch (e) { log(`补 provider 插件失败（不影响跑）：${e?.message ?? e}`) }
 
     /**
      * ⭐⭐ **给那一轮挂上 douyin 工具**（2026-10-22 修）
