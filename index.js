@@ -588,12 +588,37 @@ export function apply(ctx, config) {
     return { status: r.status ?? -1, stdout: String(r.stdout || ''), stderr: String(r.stderr || r.error || '') }
   }
 
-  /** 从脚本输出里抠出最后一个完整 JSON 对象 */
+  /**
+   * 从脚本输出里抠出**最后一个完整的** JSON 对象。
+   * ⭐ 2026-10-25 修：原实现取「第一个 { 到最后一个 }」，脚本一旦打印**两段** JSON
+   *    （qr-login.mjs start 的复用提示 + 后面的结果），这段就变成两个对象连在一起，
+   *    JSON.parse 必炸 ⇒ 返回 null ⇒ 面板报「出二维码失败」，还附一句
+   *    「没装浏览器 / Chrome 被锁」的瞎猜提示，把排查方向带偏。
+   *    现在按花括号配对扫（认得字符串和转义），只取顶层对象，返回最后一个能解析的。
+   */
   const pickJson = (s) => {
     const t = String(s || '')
-    const i = t.indexOf('{'), j = t.lastIndexOf('}')
-    if (i < 0 || j <= i) return null
-    try { return JSON.parse(t.slice(i, j + 1)) } catch { return null }
+    let depth = 0, start = -1, last = null, inStr = false, esc = false
+    for (let i = 0; i < t.length; i++) {
+      const c = t[i]
+      if (inStr) {
+        if (esc) esc = false
+        else if (c === '\\') esc = true
+        else if (c === '"') inStr = false
+        continue
+      }
+      if (c === '"') inStr = true
+      else if (c === '{') { if (depth === 0) start = i; depth++ }
+      else if (c === '}') {
+        depth--
+        if (depth === 0 && start >= 0) {
+          try { last = JSON.parse(t.slice(start, i + 1)) } catch { /* 这段坏了就跳过 */ }
+          start = -1
+        }
+        if (depth < 0) depth = 0
+      }
+    }
+    return last
   }
 
   /**
@@ -3653,6 +3678,16 @@ export function apply(ctx, config) {
       }
       if (!j.ok) {
         log(`扫码登录：${j.conflict || '失败'} ${j.error || ''}`)
+        return sendJson(res, 200, j)
+      }
+      // ⭐⭐ 已经登录过 ⇒ **绝不能**假报「二维码已出」。
+      //     面板那边只认 qr_url（client.js: if (r.ok && r.qr_url) 就 <img> 那张图），
+      //     而这里原来无条件塞 qr_url ⇒ 用户看到的 login-qr.png 是**上一次**留下的
+      //     旧图（甚至根本没生成过、直接 404）⇒ 对着过期/裂图扫半天，日志里还写着
+      //     「二维码已出（端口 undefined）」，完全误导。2026-10-25 实测卡在这里。
+      //     不带 qr_url 返回，面板会走它自己那条 already_logged_in 分支说清楚。
+      if (j.already_logged_in) {
+        log('扫码登录：不用扫 —— 浏览器里已经登录过了，凭证已导出')
         return sendJson(res, 200, j)
       }
       // 转成浏览器能直接 <img src> 的地址

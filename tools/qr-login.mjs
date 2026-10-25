@@ -207,8 +207,11 @@ async function runStart() {
       //    不知道停在哪一页的窗口（2026-10-25 实测就是停在一个滑块验证页上）。
       alreadyOpen = true
       frontWindow()
-      console.log(JSON.stringify({ ok: true, reused: true, port: PORT, pids: busy,
-        hint: '登录窗口本来就在 —— 我直接在里面出二维码' }, null, 2))
+      // ⭐ 这条只是"我复用了"的诊断信息，**别打到 stdout**：
+      //    stdout 后面还会有一条结果 JSON，两段 JSON 连在一起会让宿主那边的
+      //    pickJson 解析失败（老实现「第一个 { 到最后一个 }」必炸）⇒ 面板报
+      //    「出二维码失败」。诊断走 stderr，stdout 只留一个结果对象。
+      console.error('reused ' + PORT + ' pids=' + busy.join(','))
     } else {
       // 占着的是**后台无头**那个 ⇒ 让用户选：关掉它扫码，还是先不扫
       console.log(JSON.stringify({
