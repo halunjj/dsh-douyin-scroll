@@ -12,26 +12,40 @@
  *           每 2 秒 check 一次，成功/超时/卡在验证 都返回结构化 JSON
  *
  * 关键设计：
- *   - profile 固定放在 $DOUYIN_HOME/chrome-profile
+ *   - profile 固定放在 $DOUYIN_HOME/login-profile（**自己的**，不跟无头共用）
  *     反复登录复用同一个 profile ⇒ 设备指纹稳定 ⇒ 少一道风控
  *   - 登录成功后**保留**这个 profile，以后 `check` 还能从里面读到 cookie
  *   - 全程只用 CDP，不依赖 bb-browser（那玩意儿会吃引号）
  *
  * 🔴 2026-10-22 新增：**profile 互斥**
- *   登录用的 Chrome（有头）和干活用的 Chrome（无头）用的是**同一个 user-data-dir**。
+ *   登录用的 Chrome（有头）和干活用的 Chrome（无头）原来用的是**同一个 user-data-dir**。
  *   Chrome 不允许同一个 profile 起两个实例 ⇒ 后台无头浏览器还开着时，`start` 会
  *   起不来（新进程直接退出），而老代码只会傻等 60 秒再报"连不上 CDP"。
- *   现在起之前先检测：被占用就明确告诉你「先关掉后台那个」，并给出关闭方法。
+ *   起之前先检测：被占用就明确告诉你「先关掉后台那个」，并给出关闭方法。
+ *
+ * 🔴🔴 2026-10-25 更正：上面那条"互斥"是**症状**，根因是共用一个 profile 这件事本身。
+ *   现在两边**各用各的**（本文件用 loginProfileDir()，无头继续用暖的 chrome-profile），
+ *   所以可以同时活着、谁也不占谁。⚠️ 注意方向：搬到新 profile 的是**登录窗口** ——
+ *   反过来给无头换新 profile 试过，抖音对全新 profile 直接上风控（页面变
+ *   「验证码中间页」），采集器当场哑掉，而无头里没人能过滑块。
+ *   下面所有进程匹配（MARK）都跟着 basename(PROFILE) 走，自动只认自己这个 profile，
+ *   不会再误伤无头实例。
  * ============================================================================
  */
 import { spawn, execFileSync } from 'node:child_process'
 import { writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { join, basename } from 'node:path'
-import { homeDir } from '../lib/paths.mjs'
+import { homeDir, loginProfileDir } from '../lib/paths.mjs'
 import { findBrowser } from '../lib/chrome.mjs'
 
 const HOME = homeDir()
-const PROFILE = join(HOME, 'chrome-profile')
+/**
+ * ⭐ 2026-10-25：登录窗口用自己的 profile（原来的 chrome-profile 留给无头采集器）。
+ *    共用一个 user-data-dir 时，第二个浏览器进程会被已有实例接管然后自己退出 ⇒
+ *    端口没人监听：登录窗报「登录用的浏览器还没开」，无头报「9334 上连不上 CDP」。
+ *    ⚠️ 搬的必须是**登录窗口**：无头换新 profile 会被抖音风控（「验证码中间页」）。
+ */
+const PROFILE = loginProfileDir()
 /**
  * ⭐ 端口不再写死 9333：那会和"别的东西恰好占了 9333"冲突，而且 9333 不在
  *    lib/chrome.mjs 的扫描范围（9334–9373）里，两个模块各扫各的，谁也不认识谁。
