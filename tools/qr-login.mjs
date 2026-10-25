@@ -572,31 +572,74 @@ async function doCheck() {
      */
     let verifyKinds = []
     let pageHead = ''
+    let onPhoneWait = false
     try {
       const probe = await c.ev(`(function(){
+        var vis = function(e){ return e && e.offsetParent !== null };
         var t = (document.body && document.body.innerText || '').replace(/\\s+/g,' ');
-        var has = function(k){ return t.indexOf(k) >= 0 };
         // ⚠️ 全屏人机验证在 **iframe** 里，innerText 看不见它 —— 只能看 iframe 的 src 和标题。
-        //    以前只按中文关键词判，这类验证一个都识别不到，用户只看到「还没扫」。
         var wall = Array.prototype.slice.call(document.querySelectorAll('iframe')).some(function(f){
           return /verifycenter\\/captcha|rmc\\.bytedance\\.com|verify\\.zijieapi\\.com/.test(String(f.src || ''));
         }) || /验证码中间页|请完成验证/.test(document.title || '');
-        var sms = has('验证码') || has('短信验证') || has('获取验证码') || has('后四位');
-        var slide = has('拖动') || has('滑块') || has('请完成下方验证') || has('安全验证') || wall
-          || !!document.querySelector('[class*="captcha"],[id*="captcha"],[class*="slide-verify"]');
-        var device = has('新设备') || has('换设备') || has('设备验证') || has('身份验证');
-        var needPhone = has('绑定手机') || has('手机号');
+        /*
+         * 🔴 2026-10-25 修误报：**登录弹层自己的文案不算验证**。
+         *    扫码框里本来就有「验证码登录 / 获取验证码 / 请输入验证码」这几个字，
+         *    而且那两个输入框 offsetParent 也不为 null ⇒ 老逻辑在"扫完码、等手机确认"
+         *    这一步会一本正经地报「卡在 短信验证码 / 滑块 / 新设备确认」，
+         *    用户照它去短信页等一条永远不会来的短信（实测就是这个坑）。
+         *    ⇒ 只认**可见**且**不在登录弹层里**的元素，并按更准的信号优先。
+         */
+        var modal = Array.prototype.slice.call(document.querySelectorAll('[role="dialog"],[class*="login"],[class*="modal"]'))
+          .filter(function(e){ return vis(e) && (e.innerText || '').indexOf('扫码登录') >= 0 });
+        modal.sort(function(a, b){ return (a.innerText || '').length - (b.innerText || '').length });
+        var modalText = modal.length ? (modal[0].innerText || '').replace(/\\s+/g, ' ') : '';
+        /*
+         * ⚠️ 别只按"第一个匹配到的弹层容器"算包含关系 —— 抖音的弹层是好几层嵌套，
+         *    第一个匹配到的往往是内层 div，结果「获取验证码」这类文案就漏出来了
+         *    （实测第一次改完仍然误报"短信验证码"）。按**祖先链的 class/id** 判最稳。
+         */
+        var inModal = function(e){
+          for (var p = e; p && p !== document.body; p = p.parentElement) {
+            var sig = String(p.className || '') + ' ' + String(p.id || '');
+            if (/login|modal|dialog|captcha/i.test(sig)) return true;
+            if (p.getAttribute && p.getAttribute('role') === 'dialog') return true;
+          }
+          return false;
+        };
+        var hitVis = function(k){
+          var els = Array.prototype.slice.call(document.querySelectorAll('div,span,p,button,label'));
+          for (var i = 0; i < els.length; i++) {
+            var e = els[i];
+            if (!vis(e) || inModal(e)) continue;
+            if ((e.innerText || '').indexOf(k) >= 0) return true;
+          }
+          return false;
+        };
+        // 扫到了、正在等手机上点「确认登录」——这是最常见的一步，单独认出来
+        var onPhone = modalText.indexOf('需在手机上进行确认') >= 0 || modalText.indexOf('手机上确认') >= 0;
+        /*
+         * ⭐ 总开关：**只要扫码弹层还在**，页面上那些「验证码 / 获取验证码」字样就一定是
+         *    它自己的（手机号登录那个 tab）。抖音真到短信验证那一步时，弹层里就**不再有
+         *    「扫码登录」**了 ⇒ modal 为空、这里的排除自动失效，照样能报出来。
+         *    （实测：光靠"排除弹层子树"排不干净 —— 抖音的弹层有好几层嵌套/门户节点。）
+         */
+        var qrPanel = modal.length > 0;
+        var sms = !qrPanel && (hitVis('获取验证码') || hitVis('短信验证') || hitVis('后四位'));
+        var slide = wall || (!qrPanel && (hitVis('拖动') || hitVis('滑块') || hitVis('请完成下方验证') || hitVis('安全验证')));
+        var device = !qrPanel && (hitVis('新设备') || hitVis('换设备') || hitVis('设备验证'));
+        var needPhone = !qrPanel && hitVis('绑定手机');
         var kinds = [];
         if (wall) kinds.push('人机验证（全屏验证码，得在那个窗口里过一下）');
         if (sms) kinds.push('短信验证码');
         if (slide && !wall) kinds.push('滑块/拼图');
         if (device) kinds.push('新设备确认');
         if (needPhone) kinds.push('绑定手机号');
-        return JSON.stringify({ kinds: kinds, head: t.slice(0, 220), captcha: wall });
+        return JSON.stringify({ kinds: kinds, head: t.slice(0, 220), captcha: wall, onPhone: onPhone, modal: modalText.slice(0, 120) });
       })()`)
       const p = JSON.parse(probe || '{}')
       verifyKinds = p.kinds || []
       pageHead = p.head || ''
+      onPhoneWait = !!p.onPhone
     } catch { /* 读不到页面就跳过，不影响 cookie 判定 */ }
 
     if (!hasSession) {
@@ -605,10 +648,13 @@ async function doCheck() {
         cookie_count: cookies.length,
         important: key.filter((k) => names.includes(k)),
         verify: verifyKinds,
+        on_phone: onPhoneWait,
         page_head: pageHead,
-        hint: verifyKinds.length
-          ? `二维码已经扫过了，但抖音还要你在那个浏览器窗口里完成：${verifyKinds.join(' / ')}。做完不用重扫，再点一次「我扫完了」就行`
-          : '还没有 sessionid —— 二维码还没扫，或扫了但没在手机上点「确认登录」',
+        hint: onPhoneWait
+          ? '二维码扫到了 ✓ —— 抖音正在等你**在手机上点「确认登录」**。点了之后不用重扫，回来再点一次「我扫完了」就行'
+          : verifyKinds.length
+            ? `二维码已经扫过了，但抖音还要你在那个浏览器窗口里完成：${verifyKinds.join(' / ')}。做完不用重扫，再点一次「我扫完了」就行`
+            : '还没有 sessionid —— 二维码还没扫，或扫了但手机上还没点「确认登录」',
       }
     }
 
