@@ -70,9 +70,114 @@ const CHROME = findBrowser()
 const PROC_EXE = CHROME ? basename(CHROME) : 'chrome.exe'          // msedge.exe / chrome.exe
 const PROC_NAME = PROC_EXE.replace(/\.exe$/i, '')                  // Get-Process 用
 const PROC_FILTER = `Name='${PROC_EXE}'`
-const MARK = basename(PROFILE)                                     // 'chrome-profile'
+const MARK = basename(PROFILE)                                     // 'login-profile'
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+/* ─────────── 注入到页面里的小工具（登录入口 / 人机验证） ─────────── */
+
+/**
+ * ⭐ 2026-10-25：两个实测逼出来的修正。
+ *
+ * ① 登录入口要**穿透 shadow DOM** 找。
+ *    以前只扫 light DOM（`document.querySelectorAll`），抖音哪天把「登录」塞进
+ *    web component（shadow root）里就永远点不到 —— 报 no-login-button，
+ *    而用户盯着窗口里明晃晃的登录按钮，只会觉得插件坏了。
+ *
+ * ② 抖音现在会先甩一堵**全屏人机验证墙**（iframe 指向
+ *    rmc.bytedance.com/verifycenter/captcha，标题「验证码中间页」）。
+ *    ⚠️ 关键：它在 **iframe** 里，`document.body.innerText` **看不见 iframe 内容**
+ *    ⇒ 代码里所有靠中文关键词（拖动/滑块/验证码）的判断都识别不到它。
+ *    结果：用户扫不了码、也不知道卡在哪，只看到「登录框没出来」。
+ *    信号只能从 iframe 的 src 和页面标题上取。
+ */
+const PAGE_PROBE = `(function(){
+  var out = { url: location.href, title: document.title || '', captcha: false, login: 0, avatar: false, text: '' };
+  var ifr = Array.prototype.slice.call(document.querySelectorAll('iframe'));
+  out.captcha = ifr.some(function(f){ return /verifycenter\\/captcha|rmc\\.bytedance\\.com|verify\\.zijieapi\\.com/.test(String(f.src || '')) })
+    || /验证码中间页|请完成验证|安全验证/.test(out.title);
+  var want = ['登录', '立即登录', '登录/注册'];
+  var walk = function(root, depth){
+    if (depth > 6) return;
+    var els; try { els = root.querySelectorAll('div,span,button,a,p,section') } catch (e) { return }
+    for (var i = 0; i < els.length; i++) {
+      var e = els[i];
+      var t = (e.innerText || '').replace(/\\s+/g, '').trim();
+      if (t && t.length <= 8 && want.indexOf(t) >= 0 && e.offsetParent !== null) out.login++;
+      if (e.shadowRoot) walk(e.shadowRoot, depth + 1);
+    }
+  };
+  walk(document, 0);
+  out.avatar = !!document.querySelector('img[src*="aweme-avatar"], [class*="avatar"]');
+  var t = ((document.body && document.body.innerText) || '').replace(/\\s+/g, ' ');
+  out.text = t.slice(0, 200);
+  out.qrText = t.indexOf('扫码登录') >= 0;   // 只作诊断，不参与判定
+  /*
+   * 🔴 2026-10-25 判定收紧（两轮实测逼出来的）：
+   *    · 不能拿整页文字匹配「扫一扫」—— 抖音首页推广文案里就有，会假报"二维码已出"；
+   *    · 也不能只看"有没有手机号输入框 / 有没有含扫码登录的小容器"—— 首页上存在
+   *      **不可见**的这类节点，于是又假报一次（冷启动实测：报 panel_ready:true、
+   *      截了张 1.7MB 的首页图，弹层其实没开）。
+   *    真正的判据：**可见的**弹层容器（role=dialog / class 含 login|modal|dialog），
+   *    里面有「扫码登录」，并且带二维码元素（canvas / img / input）。
+   */
+  var modals = Array.prototype.slice.call(document.querySelectorAll('[role="dialog"],[class*="login"],[class*="modal"],[class*="dialog"]'))
+    .filter(function(e){ return e.offsetParent !== null && (e.innerText || '').indexOf('扫码登录') >= 0 });
+  modals.sort(function(a, b){ return (a.innerText || '').length - (b.innerText || '').length });
+  var modal = modals[0];
+  out.qrBox = modal ? {
+    cls: String(modal.className || '').slice(0, 50),
+    len: (modal.innerText || '').length,
+    canvas: modal.querySelectorAll('canvas').length,
+    img: modal.querySelectorAll('img').length,
+    input: modal.querySelectorAll('input').length,
+  } : null;
+  out.phone = !!document.querySelector('input[placeholder*="手机号"]');   // 只作诊断
+  out.dialogs = document.querySelectorAll('[role="dialog"],[class*="modal"],[class*="dialog"]').length;
+  out.canvas = document.querySelectorAll('canvas').length;
+  out.layerOpen = !!out.qrBox && out.qrBox.len <= 600
+    && (out.qrBox.canvas > 0 || out.qrBox.img > 0 || out.qrBox.input > 0);
+  return JSON.stringify(out);
+})()`
+
+/**
+ * 找登录入口，返回**中心坐标**（不点）—— 因为必须由 Node 侧派真鼠标事件。
+ * 按面积从小到大排：越小的元素越可能是那个真按钮（外面套着 div/span 好几层）。
+ */
+const FIND_LOGIN = `(function(){
+  var want = ['登录', '立即登录', '登录/注册'];
+  var out = [];
+  var walk = function(root, depth){
+    if (depth > 6) return;
+    var els; try { els = root.querySelectorAll('div,span,button,a,p,section') } catch (e) { return }
+    for (var i = 0; i < els.length; i++) {
+      var e = els[i];
+      if (e.shadowRoot) walk(e.shadowRoot, depth + 1);
+      var t = (e.innerText || '').replace(/\\s+/g, '').trim();
+      if (want.indexOf(t) < 0 || e.offsetParent === null) continue;
+      var r = e.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2) continue;
+      if (r.x < 0 || r.y < 0 || r.x > innerWidth - 2 || r.y > innerHeight - 2) continue;
+      out.push({ x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), area: Math.round(r.width * r.height), tag: e.tagName, cls: String(e.className || '').slice(0, 40) });
+    }
+  };
+  walk(document, 0);
+  out.sort(function(a, b){ return a.area - b.area });
+  return JSON.stringify({ cands: out.slice(0, 4) });
+})()`
+
+/**
+ * ⭐⭐ 2026-10-25：点登录入口必须用**真鼠标事件**，不能用 `el.click()`。
+ *    实测（抖音 2026-10 版）：`el.click()` 是合成事件，抖音的处理器**不认**它 ——
+ *    日志会说 `登录按钮: clicked`，但页面上什么都不发生（老代码"点了却没二维码"
+ *    就是这么来的）。换成 CDP 的 Input.dispatchMouseEvent（按下 + 抬起），
+ *    打在那个坐标上，弹层和二维码立刻就出来了。
+ */
+async function realClick(c, x, y) {
+  await c.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none', clickCount: 0 })
+  await c.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 })
+  await c.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 })
+}
 
 /** 找一个空闲端口（避开无头用的 9334–9373） */
 async function findFreePort() {
@@ -160,11 +265,25 @@ function connect(wsUrl) {
         m.error ? rej(new Error(JSON.stringify(m.error))) : res(m.result)
       }
     })
+    const send = (method, params = {}) => new Promise((res, rej) => {
+      const mid = ++id; pending.set(mid, { res, rej })
+      ws.send(JSON.stringify({ id: mid, method, params }))
+    })
+    /**
+     * ⭐ 2026-10-25 补上：这个 `ev` 以前**根本不存在**（本文件自己那份连接器只有 send/close）。
+     *    而下面 20 秒轮询弹层、doCheck 里识别"卡在短信/滑块/新设备"**全都在调 `c.ev(...)`** ——
+     *    全是 TypeError，又都被 try/catch 吞掉 ⇒ 那些探测**一直是静默死掉的**：
+     *      · 弹层明明开了也永远报 panel_ready:false、不截图（用户以为没打开）
+     *      · 扫完码卡在验证页也永远探测不到（用户只看到"还没扫"）
+     *    现在它真的会求值。页面里抛错就抛出来（调用方自己决定要不要继续等）。
+     */
+    const ev = async (expr) => {
+      const r = await send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true })
+      if (r && r.exceptionDetails) throw new Error('页面里抛错: ' + JSON.stringify(r.exceptionDetails).slice(0, 200))
+      return r && r.result ? r.result.value : undefined
+    }
     ws.addEventListener('open', () => resolve({
-      send: (method, params = {}) => new Promise((res, rej) => {
-        const mid = ++id; pending.set(mid, { res, rej })
-        ws.send(JSON.stringify({ id: mid, method, params }))
-      }),
+      send, ev,
       close: () => ws.close(),
     }))
     ws.addEventListener('error', reject)
@@ -274,21 +393,12 @@ async function runStart() {
     alreadyLoggedIn = names.includes('sessionid') || names.includes('sessionid_ss')
   } catch { alreadyLoggedIn = false }
 
-  // 点开登录弹层（已经登录就跳过）
-  const clickRes = await c.send('Runtime.evaluate', {
-    expression: `(function(){
-      var els = Array.prototype.slice.call(document.querySelectorAll('div,span,button,a,p'));
-      var hit = els.find(function(e){
-        var t = (e.innerText||'').trim();
-        return t === '登录' && e.offsetParent !== null;
-      });
-      if (hit) { hit.click(); return 'clicked'; }
-      return document.querySelector('img[src*="aweme-avatar"], [class*="avatar"]') ? 'looks-logged-in' : 'no-login-button';
-    })()`,
-    returnByValue: true,
-  })
-  const loginState = String(clickRes.result?.value || '')
-  console.log('登录按钮:', loginState, '/ cookie 里已有 sessionid:', alreadyLoggedIn)
+  // 先看一眼页面：是卡在人机验证上、有没有登录入口、还是已经登录了
+  const p0 = JSON.parse((await c.ev(PAGE_PROBE).catch(() => '{}')) || '{}')
+  const loginState = p0.login ? 'has-login-entry' : (p0.avatar ? 'looks-logged-in' : 'no-login-button')
+  console.log('页面:', String(p0.url || '').slice(0, 60), '/ 标题:', String(p0.title || '').slice(0, 30),
+    '/ 登录入口:', p0.login, '个 / 人机验证:', p0.captcha ? '有（要用户自己过）' : '无',
+    '/ 已有 sessionid:', alreadyLoggedIn)
 
   /**
    * ⭐ 2026-10-22 实测踩到：这个 Chrome profile 里**早就登录过了**（复用过很多次）。
@@ -315,34 +425,61 @@ async function runStart() {
    * 等登录弹层展开完。
    * ⭐ 2026-10-22 实测：抖音这个弹层是**异步渲染**的，而且慢（4 秒经常还不够）。
    *    太早点会点空、太早探测会得到 panel_ready=false，让用户以为没打开。
-   *    ⇒ 轮询最多 20 秒，看到「扫码登录 / 请输入手机号」就算好了。
+   *    ⇒ 轮询，看到「扫码登录 / 请输入手机号」就算好了。
+   * ⭐ 2026-10-25：抖音要是先甩了**人机验证墙**，就得给用户时间自己过 ——
+   *    验证在 iframe 里，我们代劳不了（也不该代劳）。所以这种情况多等一会儿，
+   *    等验证墙消失后再补点一次登录入口。
    */
-  let layerOk = false
-  for (let i = 0; i < 20; i++) {
+  let layerOk = p0.layerOpen
+  let captcha = !!p0.captcha
+  let diag = { url: p0.url, title: p0.title, login_nodes: p0.login, avatar: !!p0.avatar }
+  let clicked = 'none'
+
+  /**
+   * ⭐⭐ 2026-10-25：开弹层要用**真鼠标事件**（realClick），不能用 el.click()。
+   *    候选按面积从小到大试（最里面那个才是真按钮），每个都验证弹层到底开没开 ——
+   *    所以就算抖音明天换个入口位置，这里也是"试到开为止"，不是写死一个选择器。
+   */
+  if (!layerOk && !captcha && p0.login) {
+    const found = JSON.parse((await c.ev(FIND_LOGIN).catch(() => '{}')) || '{}')
+    for (const cand of (found.cands || []).slice(0, 4)) {
+      clicked = `real-click ${cand.tag}@${cand.x},${cand.y}`
+      await realClick(c, cand.x, cand.y)
+      await sleep(2500)
+      const p = JSON.parse((await c.ev(PAGE_PROBE).catch(() => '{}')) || '{}')
+      diag = { url: p.url, title: p.title, login_nodes: p.login, avatar: !!p.avatar, qr_box: p.qrBox || null, phone: !!p.phone }
+      if (p.captcha) { captcha = true; break }
+      if (p.layerOpen) { layerOk = true; break }
+    }
+  }
+
+  const tries = captcha ? 55 : 20
+  for (let i = 0; i < tries && !layerOk; i++) {
     await sleep(1000)
     try {
-      const probe = await c.ev(`(function(){
-        var t = (document.body && document.body.innerText || '');
-        return JSON.stringify({
-          hasQrText: t.indexOf('扫码登录') >= 0 || t.indexOf('扫一扫') >= 0 || t.indexOf('打开「抖音APP」') >= 0,
-          hasCanvas: !!document.querySelector('canvas'),
-          hasPhone: t.indexOf('请输入手机号') >= 0,
-        });
-      })()`)
-      const p = JSON.parse(probe || '{}')
-      if (p.hasQrText || p.hasPhone) { layerOk = true; break }
-      // 到第 6 秒还没出来，再点一次「登录」（第一次点可能落在未渲染完的按钮上）
-      if (i === 5) {
-        try {
-          await c.ev(`(function(){
-            var els = Array.prototype.slice.call(document.querySelectorAll('div,span,button,a,p'));
-            var hit = els.find(function(e){ var t=(e.innerText||'').trim(); return t === '登录' && e.offsetParent !== null });
-            if (hit) { hit.click(); return 'clicked' } return 'none';
-          })()`)
-        } catch { /* 点不到就算了，继续等 */ }
+      const p = JSON.parse((await c.ev(PAGE_PROBE)) || '{}')
+      diag = { url: p.url, title: p.title, login_nodes: p.login, avatar: !!p.avatar, qr_box: p.qrBox || null, phone: !!p.phone }
+      const wasCaptcha = captcha
+      if (p.captcha) captcha = true
+      // 补点一次：① 第一次可能点空/弹层还没渲染好；② 刚过完人机验证那一下
+      if (!p.layerOpen && p.login && (i === 5 || (wasCaptcha && !p.captcha))) {
+        const found = JSON.parse((await c.ev(FIND_LOGIN).catch(() => '{}')) || '{}')
+        const cand = (found.cands || [])[0]
+        if (cand) { await realClick(c, cand.x, cand.y); clicked = `real-click ${cand.tag}@${cand.x},${cand.y}` }
       }
+      if (p.layerOpen) layerOk = true
     } catch { /* 读不到页面就继续等 */ }
   }
+  console.log('登录入口:', clicked, '/ 弹层:', layerOk ? '开了 ✓' : '没开')
+
+  /**
+   * ⭐⭐ 2026-10-25：**必须在这里截图**。
+   *    面板那张二维码是 `<img src="/api/douyin-duty/login/qr.png">`，而那个文件只有截了才有；
+   *    以前 `start` 从头到尾没调过 shoot() ⇒ 就算弹层开对了，面板也永远是「还没有二维码」，
+   *    或者显示上一次留下的陈旧图。现在弹层一开就截。
+   */
+  let qrFile = ''
+  try { if (layerOk) qrFile = await shoot('login-qr') } catch { /* 截图失败不致命，别把整个流程弄挂 */ }
   c.close()
 
   // 把登录窗口顶到最前面（用户可能在别的窗口里）
@@ -356,10 +493,18 @@ async function runStart() {
     port: PORT,
     window: front,
     login_button: loginState,
+    clicked,
     panel_ready: layerOk,
+    captcha,
+    qr: qrFile,
+    diag,
     hint: layerOk
-      ? '浏览器窗口已经打开、登录框也出来了 —— 用手机抖音扫那个窗口里的二维码。扫完如果还要短信验证码/滑块，就在那个窗口里做完，回来点「我扫完了」'
-      : '浏览器窗口已经打开了。如果没看到登录框，就在那个窗口里点一下右上角「登录」；二维码出来用手机扫，扫完回来点「我扫完了」',
+      ? '窗口开着、登录框和二维码都出来了 —— 用手机抖音扫那个窗口里的二维码。扫完如果还要短信验证码/滑块，就在那个窗口里做完，回来点「我扫完了」'
+      : captcha
+        ? '抖音先给你弹了**人机验证**（滑块/点选图片），这一步只能人来过：切到刚打开的那个浏览器窗口把验证做掉 —— 过了它自己就会显示登录入口和二维码，然后回来点「我扫完了」'
+        : diag.login_nodes === 0 && !diag.avatar
+          ? '窗口开了，但这个页面上连「登录」入口都没有（抖音改版了，或者页面还没渲染完）。切到那个窗口刷新一下、再点一次「扫码登录」；还不行就把窗口截图发我'
+          : '窗口已经打开了，但登录框没弹出来。我在那个窗口里替你点过右上角「登录」了 —— 你也可以自己点一下试试；实在不行回来点「关掉后台浏览器重试」再点「扫码登录」',
   }, null, 2))
 }
 
@@ -431,17 +576,23 @@ async function doCheck() {
       const probe = await c.ev(`(function(){
         var t = (document.body && document.body.innerText || '').replace(/\\s+/g,' ');
         var has = function(k){ return t.indexOf(k) >= 0 };
+        // ⚠️ 全屏人机验证在 **iframe** 里，innerText 看不见它 —— 只能看 iframe 的 src 和标题。
+        //    以前只按中文关键词判，这类验证一个都识别不到，用户只看到「还没扫」。
+        var wall = Array.prototype.slice.call(document.querySelectorAll('iframe')).some(function(f){
+          return /verifycenter\\/captcha|rmc\\.bytedance\\.com|verify\\.zijieapi\\.com/.test(String(f.src || ''));
+        }) || /验证码中间页|请完成验证/.test(document.title || '');
         var sms = has('验证码') || has('短信验证') || has('获取验证码') || has('后四位');
-        var slide = has('拖动') || has('滑块') || has('请完成下方验证') || has('安全验证')
+        var slide = has('拖动') || has('滑块') || has('请完成下方验证') || has('安全验证') || wall
           || !!document.querySelector('[class*="captcha"],[id*="captcha"],[class*="slide-verify"]');
         var device = has('新设备') || has('换设备') || has('设备验证') || has('身份验证');
         var needPhone = has('绑定手机') || has('手机号');
         var kinds = [];
+        if (wall) kinds.push('人机验证（全屏验证码，得在那个窗口里过一下）');
         if (sms) kinds.push('短信验证码');
-        if (slide) kinds.push('滑块/拼图');
+        if (slide && !wall) kinds.push('滑块/拼图');
         if (device) kinds.push('新设备确认');
         if (needPhone) kinds.push('绑定手机号');
-        return JSON.stringify({ kinds: kinds, head: t.slice(0, 220) });
+        return JSON.stringify({ kinds: kinds, head: t.slice(0, 220), captcha: wall });
       })()`)
       const p = JSON.parse(probe || '{}')
       verifyKinds = p.kinds || []
