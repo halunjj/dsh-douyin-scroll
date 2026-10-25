@@ -26,7 +26,7 @@
  */
 import { spawn, execFileSync } from 'node:child_process'
 import { writeFileSync, existsSync, mkdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, basename } from 'node:path'
 import { homeDir } from '../lib/paths.mjs'
 import { findBrowser } from '../lib/chrome.mjs'
 
@@ -44,6 +44,20 @@ const cdpUrl = () => `http://127.0.0.1:${PORT}`
 // 但"找浏览器"这件事必须共用同一套探测逻辑（换台机器 Chrome 装在别处也能用）。
 const CHROME = findBrowser()
 
+/**
+ * 🔴 2026-10-25 修：下面三个进程探测原来把进程名**写死成 `chrome.exe`**。
+ *    findBrowser() 在这台机器上选的是 **msedge.exe**，于是：
+ *      profileInUse() 永远返回空 ⇒ 脚本以为 profile 没人占 ⇒
+ *      findFreePort() 看到上一个登录窗口占着 9374 就换 9375 ⇒
+ *      同一个 user-data-dir 再起一个 Edge ⇒ Edge 直接交给已有实例、新进程退出 ⇒
+ *      9375 永远没人监听 ⇒ 报「登录用的浏览器还没开」（面板上的「扫码登录」按钮同样死在这里）。
+ *    现在进程名跟着实际浏览器走，并且**复用已经开着的登录窗口**。
+ */
+const PROC_EXE = CHROME ? basename(CHROME) : 'chrome.exe'          // msedge.exe / chrome.exe
+const PROC_NAME = PROC_EXE.replace(/\.exe$/i, '')                  // Get-Process 用
+const PROC_FILTER = `Name='${PROC_EXE}'`
+const MARK = basename(PROFILE)                                     // 'chrome-profile'
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 /** 找一个空闲端口（避开无头用的 9334–9373） */
@@ -59,24 +73,44 @@ async function findFreePort() {
   throw new Error('9374–9413 全被占用了，找不到登录用的调试端口（可以用 QR_CDP_PORT 指定一个）')
 }
 
-/** 有没有别的 Chrome 正在用我们这个 profile？ */
+/** 有没有别的浏览器正在用我们这个 profile？ */
 function profileInUse() {
   try {
     const out = execFileSync('powershell.exe', ['-NoProfile', '-Command',
-      `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | ` +
-      `Where-Object { $_.CommandLine -like '*chrome-profile*' } | ` +
+      `Get-CimInstance Win32_Process -Filter "${PROC_FILTER}" | ` +
+      `Where-Object { $_.CommandLine -like '*${MARK}*' } | ` +
       `Select-Object -ExpandProperty ProcessId`],
       { encoding: 'utf8', timeout: 15000 })
     return String(out || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
   } catch { return [] }
 }
 
-/** 关掉占着 profile 的 Chrome（只在用户明确要求时用） */
+/**
+ * 已经在跑的那个实例会把调试端口写在命令行里 ⇒ 直接读出来复用。
+ * ⭐ 只认**可见登录窗口**那一段端口（≥9374）；9334–9373 是后台无头浏览器的，
+ *    复用它等于对着一个没有窗口的浏览器截二维码，用户永远扫不到。
+ */
+function runningCdpPort() {
+  try {
+    const out = execFileSync('powershell.exe', ['-NoProfile', '-Command',
+      `Get-CimInstance Win32_Process -Filter "${PROC_FILTER}" | ` +
+      `Where-Object { $_.CommandLine -like '*${MARK}*' } | ` +
+      `ForEach-Object { if ($_.CommandLine -match '--remote-debugging-port=(\\d+)') { $Matches[1] } }`],
+      { encoding: 'utf8', timeout: 15000 })
+    for (const s of String(out || '').split(/\r?\n/)) {
+      const p = Number(String(s).trim())
+      if (p >= 9374 && p < 9414) return p
+    }
+    return 0
+  } catch { return 0 }
+}
+
+/** 关掉占着 profile 的浏览器（只在用户明确要求时用） */
 function closeProfileChrome() {
   try {
     execFileSync('powershell.exe', ['-NoProfile', '-Command',
-      `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | ` +
-      `Where-Object { $_.CommandLine -like '*chrome-profile*' } | ` +
+      `Get-CimInstance Win32_Process -Filter "${PROC_FILTER}" | ` +
+      `Where-Object { $_.CommandLine -like '*${MARK}*' } | ` +
       `ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`],
       { encoding: 'utf8', timeout: 20000 })
     return true
@@ -86,12 +120,16 @@ function closeProfileChrome() {
 /**
  * 把登录窗口顶到最前面。
  * ⭐ 用户可能正开着别的窗口（甚至全屏），不置顶的话他不知道去哪儿扫码。
+ * ⭐ 只看**用我们这个 profile 的**那些进程：以前是 `Get-Process chrome`，
+ *    会把用户平时那个浏览器窗口也拉上来（浏览器是 Edge 时更荒唐，连名字都不对）。
  *    返回 'front <pid>' 或 'no-window'（不抛）。
  */
 function frontWindow() {
   try {
     return String(execFileSync('powershell.exe', ['-NoProfile', '-Command',
-      `$p = Get-Process chrome -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1; ` +
+      `$ids = @(Get-CimInstance Win32_Process -Filter "${PROC_FILTER}" | ` +
+      `Where-Object { $_.CommandLine -like '*${MARK}*' } | Select-Object -ExpandProperty ProcessId); ` +
+      `$p = Get-Process -Id $ids -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1; ` +
       `if($p){ $ws = New-Object -ComObject WScript.Shell; [void]$ws.AppActivate($p.Id); Write-Output ('front ' + $p.Id) } else { Write-Output 'no-window' }`],
       { encoding: 'utf8', timeout: 20000 })).trim()
   } catch { return 'no-window' }
@@ -170,45 +208,56 @@ async function runStart() {
     return
   }
 
-  // ⭐ 先看看这个 profile 是不是已经被后台无头浏览器占着
+  // ⭐ 先看看这个 profile 是不是已经有人占着
   const busy = profileInUse()
+  // ⭐ 已经开着的**可见**登录窗口会把端口写在命令行里 —— 读出来复用，
+  //    否则 findFreePort() 会挑一个没人监听的端口，然后同一个 profile 起第二个
+  //    浏览器（新进程立刻交给老实例并退出），现象就是「登录用的浏览器还没开」。
+  let alreadyOpen = false
+  if (!PORT) PORT = runningCdpPort()
   if (busy.length) {
     // 已经有登录窗口开着（端口能连上）⇒ 直接复用，把窗口顶到前面
     let alive = false
     try { alive = (await fetch(`${cdpUrl()}/json/version`)).ok } catch { alive = false }
     if (alive) {
+      // ⭐ 复用：不另起浏览器，但**继续往下走** —— 该点的「登录」还点，
+      //    该截的二维码还截。老代码这里直接 return，用户看到的还是上一次那个
+      //    不知道停在哪一页的窗口（2026-10-25 实测就是停在一个滑块验证页上）。
+      alreadyOpen = true
       frontWindow()
       console.log(JSON.stringify({ ok: true, reused: true, port: PORT, pids: busy,
-        hint: '登录窗口已经开着了 —— 直接在那个 Chrome 窗口里扫码就行' }, null, 2))
+        hint: '登录窗口本来就在 —— 我直接在里面出二维码' }, null, 2))
+    } else {
+      // 占着的是**后台无头**那个 ⇒ 让用户选：关掉它扫码，还是先不扫
+      console.log(JSON.stringify({
+        ok: false,
+        conflict: 'profile_in_use',
+        pids: busy,
+        error: '后台的无头浏览器占着这个浏览器配置，扫码窗口开不起来（同一个配置不能开两个）',
+        hint: '点「先关掉后台浏览器，再出二维码」——关掉的是插件自己在后台跑的那个，不影响你平时用的浏览器',
+        can_kill: true,
+      }, null, 2))
       return
     }
-    // 占着的是**后台无头**那个 ⇒ 让用户选：关掉它扫码，还是先不扫
-    console.log(JSON.stringify({
-      ok: false,
-      conflict: 'profile_in_use',
-      pids: busy,
-      error: '后台的无头浏览器占着这个 Chrome 配置，扫码窗口开不起来（Chrome 不允许同一个配置开两个）',
-      hint: '点「先关掉后台浏览器，再出二维码」——关掉的是插件自己在后台跑的那个，不影响你平时用的 Chrome',
-      can_kill: true,
-    }, null, 2))
-    return
   }
 
-  PORT = PORT || await findFreePort()
-  mkdirSync(PROFILE, { recursive: true })
-  const args = [
-    `--remote-debugging-port=${PORT}`,
-    `--user-data-dir=${PROFILE}`,
-    '--no-first-run',
-    '--no-default-browser-check',
-    '--disable-features=Translate,OptimizationHints',
-    '--window-size=1280,900',
-    '--window-position=120,60',
-    'https://www.douyin.com/',
-  ]
-  const p = spawn(CHROME, args, { detached: true, stdio: 'ignore' })
-  p.unref()
-  console.log('chrome pid =', p.pid, '\nprofile =', PROFILE)
+  if (!alreadyOpen) {
+    PORT = PORT || await findFreePort()
+    mkdirSync(PROFILE, { recursive: true })
+    const args = [
+      `--remote-debugging-port=${PORT}`,
+      `--user-data-dir=${PROFILE}`,
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-features=Translate,OptimizationHints',
+      '--window-size=1280,900',
+      '--window-position=120,60',
+      'https://www.douyin.com/',
+    ]
+    const p = spawn(CHROME, args, { detached: true, stdio: 'ignore' })
+    p.unref()
+    console.log('chrome pid =', p.pid, '\nprofile =', PROFILE)
+  }
 
   const c = await pageConn()
   await sleep(3500)
