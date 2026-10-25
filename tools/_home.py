@@ -17,6 +17,7 @@ tools/_home.py —— Python 脚本**唯一**的家目录来源
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 
@@ -47,4 +48,14 @@ def plugin_dir() -> Path:
 
 
 def node_bin() -> str:
-    return os.environ.get("DOUYIN_NODE") or "node"
+    """Node 解释器。
+
+    2026-10-25：原来只返回 `DOUYIN_NODE` 或裸名 `"node"` —— PATH 里没有 node 时，
+    调用方（api-comments.py / api-reply.py 的 sign()）拿到的是一个
+    `FileNotFoundError: [WinError 2] 系统找不到指定的文件`，
+    跟真实原因（这机器上 node 不在 PATH）毫无关系。现在先 DOUYIN_NODE，再真去 PATH 里找。
+    """
+    env = (os.environ.get("DOUYIN_NODE") or "").strip()
+    if env:
+        return env
+    return shutil.which("node") or shutil.which("node.exe") or "node"

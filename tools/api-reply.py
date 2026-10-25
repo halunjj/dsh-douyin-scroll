@@ -18,15 +18,19 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _home import home_str  # noqa: E402
+from _home import home_str, node_bin, plugin_dir  # noqa: E402
 import time
 import urllib.parse
 
 import httpx
 
 HOME = home_str()
-PLUGIN = r"D:\aiagent\deepseek\dsh-douyin-scroll"
-NODE = r"C:\Program Files\nodejs\node.exe"
+# 🔴 2026-10-25 修：跟 api-comments.py 同一个 bug —— 原来写死了作者本机的
+#     PLUGIN = r"D:\aiagent\deepseek\dsh-douyin-scroll"
+#     NODE   = r"C:\Program Files\nodejs\node.exe"
+#   换台机器就 WinError 2 ⇒ 签名这一步直接失败（回评论/查签名全废）。
+PLUGIN = str(plugin_dir())
+NODE = node_bin()
 SIGNER = os.path.join(PLUGIN, "tools", "dy-signer.mjs")
 VENVPY = os.path.join(HOME, ".venv", "Scripts", "python.exe")
 GUARD = os.path.join(PLUGIN, "tools", "session-guard.py")

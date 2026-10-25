@@ -11,14 +11,20 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _home import home_str  # noqa: E402
+from _home import home_str, node_bin, plugin_dir  # noqa: E402
 import urllib.parse
 
 import httpx
 
 HOME = home_str()
-PLUGIN = r"D:\aiagent\deepseek\dsh-douyin-scroll"
-NODE = r"C:\Program Files\nodejs\node.exe"
+# 🔴 2026-10-25 修：这两行原来是作者**本机**的绝对路径 ——
+#     PLUGIN = r"D:\aiagent\deepseek\dsh-douyin-scroll"
+#     NODE   = r"C:\Program Files\nodejs\node.exe"
+#   换台机器必然 WinError 2（系统找不到指定的文件）⇒ sign() 失败
+#   ⇒ 每一轮的高赞评论全空（证据包里 top_comments 全空就是这么来的）。
+#   仓库本来就有 tools/_home.py 专门干这事，这两个文件当时漏改了。
+PLUGIN = str(plugin_dir())
+NODE = node_bin()
 SIGNER = os.path.join(PLUGIN, "tools", "dy-signer.mjs")
 COOKIE = open(os.path.join(HOME, "douyin_cookie.txt"), encoding="utf-8").read().strip()
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
