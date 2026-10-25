@@ -265,6 +265,15 @@ function connect(wsUrl) {
         m.error ? rej(new Error(JSON.stringify(m.error))) : res(m.result)
       }
     })
+    // ⭐ 2026-10-25：连接断了要把挂着的 promise 全 reject —— 否则浏览器一死，
+    //    所有 `c.send`/`c.ev` 永远不 settle，调用方只看到 "Detected unsettled
+    //    top-level await"，读不出"浏览器死了"（同一类坑在 lib/chrome.mjs 也修了）。
+    const failAll = (why) => {
+      for (const { rej } of pending.values()) rej(new Error(why))
+      pending.clear()
+    }
+    ws.addEventListener('close', () => failAll('CDP 连接断了（浏览器关了或被干掉了？）'))
+    ws.addEventListener('error', () => failAll('CDP 连接出错（浏览器关了或被干掉了？）'))
     const send = (method, params = {}) => new Promise((res, rej) => {
       const mid = ++id; pending.set(mid, { res, rej })
       ws.send(JSON.stringify({ id: mid, method, params }))
