@@ -30,6 +30,25 @@
 - 文案/提示词的禁令一起放开（README / AGENTS / `prompts/duty.md`）：
   **不做** OCR / ASR 不变，但"不做抽帧"改成"`douyin_frames` 抽就行，别自己另起炉灶"。
 
+### 🔧 抽帧下不到视频：prime CDN 一律 403，改走 `video_id`
+
+第一版抽帧实测就翻车：封面拿到、**视频 403**，只出了一张封面。逐条排除后拿到结论——
+**不是链接过期、也不是请求头问题**：
+
+- 接口发的 `play_addr` 现在指向 `v11-web-prime.douyinvod.com` 这类 **prime 节点**，
+  直接抓一律 `403 / 0 字节 / server: Lego Server`；换 UA、去掉 Cookie、带 Range、
+  换 Referer（视频页/主页）、换 TLS 指纹（chrome / chrome131 / safari17_0）**全 403**；
+  `expire` 还剩 2.8 小时，所以也不是过期。
+- ✅ 能走通的是 **`video.play_addr.uri`（vid）+ `/aweme/v1/play/?video_id=<vid>&ratio=720p&line=0`**
+  —— 实测 **200 + 2.0~2.7MB 真 mp4**（还会自己 302 到可用 CDN）。而且 **vid 不过期**，
+  候选清单放一小时再抽帧也不会失败（签名式 `play_url` 会过期）。
+- ⇒ `forward-pick.py` 增 `play_vid`（`play_url` 降级成兜底），`frames.py` 按
+  vid-720p → vid-1080p → play_url 的顺序试，失败原因原样写进 `warnings`。
+
+实测（aweme `7691615398656027877`，4 张图全到）：封面是炒方便面，帧里才看出这视频
+套着**植物大战僵尸的界面**（戴夫厨房、食材条、"切丁""起锅烧油"）——标题一个字没提。
+`douyin_prescreen` 带 `frames:1` 也验过（`attached: 3`）。
+
 > 仍然**不做** OCR（不认字）和 ASR（不听声）—— 画面靠抽帧看，字和声不碰。
 
 ---

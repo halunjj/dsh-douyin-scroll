@@ -16,7 +16,14 @@ tools/frames.py —— 把一条视频真的**拆成一张张图**
      ⇒ 没有 ffmpeg 也至少能看见一张。
 
   ② **真帧**（要 ffmpeg）
-     下载 `play_addr` 的 mp4，按时长等距离切 N 帧（默认 3 帧、宽 640）。
+     下载 mp4，按时长等距离切 N 帧（默认 3 帧、宽 640）。
+     ⚠️ **别直接用候选里的 play_url**（2026-10-25 实测）：接口发的 play_addr 现在指向
+     `v11-web-prime.douyinvod.com` 这类 prime CDN，**直接抓一律 403** —— 换 UA、去掉 Cookie、
+     带 Range、换 Referer、换 TLS 指纹（chrome/chrome131/safari）全试过，都是 `403 / 0 字节 /
+     server: Lego Server`。能走通的是用 **vid**（`video.play_addr.uri`）打
+     `https://www.douyin.com/aweme/v1/play/?video_id=<vid>&ratio=720p&line=0`
+     —— 实测 200 + 2.0~2.7MB 真 mp4，而且 **vid 不过期**（签名式 play_url 会过期）。
+     所以顺序是：vid 那条路 → 候选里的 play_url 兜底。
      ffmpeg 不在 PATH 上也不打紧 —— 按这个顺序找：
        `DOUYIN_FFMPEG` 环境变量 → venv 里的 imageio-ffmpeg → PATH 上的 ffmpeg
        → 都没有就 `pip install imageio-ffmpeg`（约 31MB 静态二进制，装一次长期用）
@@ -66,6 +73,7 @@ CACHE_DIR = os.path.join(HOME, "cache", "video")
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
 REFERER = "https://www.douyin.com/"
+BASE = "https://www.douyin.com"       # vid → /aweme/v1/play/ 那条路要用
 
 DEFAULT_FRAMES = 3
 DEFAULT_WIDTH = 640
@@ -129,6 +137,32 @@ def http_get_bytes(url, cookie, timeout=60):
 
 def is_jpeg(b):
     return bool(b) and len(b) > 512 and b[:2] == b"\xff\xd8"
+
+
+def play_url_from_vid(vid, ratio="720p"):
+    """⭐ vid → 可用的播放地址。抖音自己 302 到 CDN，不用签名、不过期。"""
+    return "%s/aweme/v1/play/?video_id=%s&ratio=%s&line=0" % (BASE, vid, ratio)
+
+
+def download_video_body(vid, play_url, cookie, aweme_id):
+    """
+    把 mp4 拿下来。返回 (bytes, 用哪条路, 各条路的失败原因)。
+    顺序：vid（首选，实测 200）→ 候选里的 play_url（prime CDN，多半 403）。
+    """
+    tried = []
+    cands = []
+    if vid:
+        cands.append(("vid-720p", play_url_from_vid(vid, "720p")))
+        cands.append(("vid-1080p", play_url_from_vid(vid, "1080p")))
+    if play_url:
+        cands.append(("play_url(候选里那条)", play_url))
+    for name, u in cands:
+        body, err = http_get_bytes(u, cookie, timeout=180)
+        if body and len(body) >= 4096:
+            return body, name, tried
+        tried.append("%s → %s" % (name, err or "太短"))
+        note("· %s 没成：%s" % (name, err or "太短"))
+    return None, "", tried
 
 
 def find_ffmpeg(allow_install=True):
@@ -266,7 +300,8 @@ def main():
     ap.add_argument("--keep-video", action="store_true", help="保留下载的 mp4（默认也留在 cache 里复用）")
     ap.add_argument("--clean", action="store_true", help="删掉这条的图 + 缓存视频，不抽帧")
     ap.add_argument("--cover-url", help="直接给封面地址（不在候选清单里时用）")
-    ap.add_argument("--play-url", help="直接给视频地址（不在候选清单里时用）")
+    ap.add_argument("--play-url", help="直接给视频地址（不在候选清单里时用；prime CDN 多半 403）")
+    ap.add_argument("--vid", dest="vid", help="视频 vid（video.play_addr.uri）—— 抽帧首选，不在候选清单里时用")
     ap.add_argument("--list", action="store_true", help="列出已经抽过图的 aweme_id")
     args = ap.parse_args()
 
@@ -296,6 +331,7 @@ def main():
     row = find_row(aweme_id) or {}
     cover_url = args.cover_url or row.get("cover_url") or ""
     play_url = args.play_url or row.get("play_url") or ""
+    play_vid = getattr(args, "vid", None) or row.get("play_vid") or ""
     duration = row.get("duration_s") or 0
     try:
         duration = float(duration or 0)
@@ -303,11 +339,11 @@ def main():
         duration = 0.0
 
     warnings = []
-    if not cover_url and not play_url:
-        msg = ("候选清单里没有这条（%s），也没有给 --cover-url/--play-url ⇒ 拿不到画面。"
+    if not cover_url and not play_url and not play_vid:
+        msg = ("候选清单里没有这条（%s），也没有给 --cover-url/--play-url/--vid ⇒ 拿不到画面。"
                "先跑 forward-pick.py 把候选拉出来。" % aweme_id)
         print(json.dumps({"ok": False, "aweme_id": aweme_id, "error": msg,
-                          "hint": "forward-pick.json 里 rows[].cover_url / play_url 是画面入口"},
+                          "hint": "forward-pick.json 里 rows[].cover_url / play_vid 是画面入口"},
                          ensure_ascii=False, indent=1))
         return 1
 
@@ -342,7 +378,7 @@ def main():
 
     # ── ② 真帧 ──
     want = 0 if args.cover_only else max(0, min(int(args.frames or 0), 12))
-    if want and play_url:
+    if want and (play_vid or play_url):
         ffmpeg, src = find_ffmpeg()
         if not ffmpeg:
             warnings.append("没有 ffmpeg ⇒ 只拿到封面。装它：venv 里 pip install imageio-ffmpeg，"
@@ -354,15 +390,15 @@ def main():
             video = os.path.join(CACHE_DIR, "%s.mp4" % aweme_id)
             need_dl = (not os.path.exists(video)) or os.path.getsize(video) < 4096
             if need_dl:
-                note("· 下载视频…")
-                body, err = http_get_bytes(play_url, cookie, timeout=180)
-                if not body or len(body) < 4096:
-                    warnings.append("视频下载失败：%s（只拿到封面）" % err)
-                    note("· 视频 ✗ %s" % err)
+                note("· 下载视频…（vid=%s）" % (play_vid or "-"))
+                body, via, tried = download_video_body(play_vid, play_url, cookie, aweme_id)
+                if not body:
+                    warnings.append("视频下载失败（只拿到封面）：" + "；".join(tried))
+                    note("· 视频 ✗ 全试过了")
                 else:
                     with open(video, "wb") as f:
                         f.write(body)
-                    note("· 视频 ✓ %.1f MB" % (len(body) / 1048576.0))
+                    note("· 视频 ✓ %.1f MB（走 %s）" % (len(body) / 1048576.0, via))
             if os.path.exists(video) and os.path.getsize(video) >= 4096:
                 if not duration:
                     duration = probe_duration(ffmpeg, video)
@@ -380,8 +416,8 @@ def main():
                         note("  frame-%d ✗ %s" % (i, err))
             if not args.keep_video and os.path.exists(video):
                 pass          # 默认**留着**：同一轮里再抽别的帧不用重下（--clean 才删）
-    elif want and not play_url:
-        warnings.append("候选里没有 play_addr（这条可能被限流/是图集）⇒ 只有封面")
+    elif want and not (play_vid or play_url):
+        warnings.append("候选里没有 play_vid / play_addr（这条可能被限流/是图集）⇒ 只有封面")
 
     rec = {
         "ok": True,
@@ -391,6 +427,7 @@ def main():
         "author": row.get("author") or "",
         "duration_s": duration or None,
         "cover_url": bool(cover_url),
+        "play_vid": play_vid or "",
         "play_url": bool(play_url),
         "frames": frames,
         "warnings": warnings,

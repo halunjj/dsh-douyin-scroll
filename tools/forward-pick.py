@@ -5,7 +5,7 @@ tools/forward-pick.py —— 刷一轮：拉候选 → 打分 → 生成「转�
 ============================================================================
 只读、**不签名**、不碰写接口。判断依据来自 JSON 字段：
 desc / tags / author / create_time / duration / digg·comment·collect·share / 高赞评论，
-外加**画面**（2026-10-25 起）：cover_url（抖音自己那帧封面）+ play_url（真视频地址）。
+外加**画面**（2026-10-25 起）：cover_url（抖音自己那帧封面）+ play_vid / play_url（视频入口）。
 ⚠️ 这两样以前在**落盘时就被丢掉**，所以后面 tools/frames.py 想抽帧也没料 —— 别再删。
 不做 ASR/OCR（听声、认字），画面走 frames.py 抽帧这条路。
 
@@ -103,8 +103,29 @@ def cover_of(a):
 
 
 def play_of(a):
-    """真视频地址：抽帧用。download_addr 通常和 play_addr 同一个文件。"""
+    """
+    真视频地址（**兜底用**，见下面的 play_vid）：抽帧用。
+    ⚠️ 2026-10-25 实测：接口发回来的 play_addr 大多指向 `v11-web-prime.douyinvod.com`
+       这类 **prime CDN，直接抓一律 403**（换 UA / 不加 Cookie / 带 Range / 换 Referer
+       全试过，都是 403，`server: Lego Server`，body 为空）。能用的路是用
+       `video_id` 走 `https://www.douyin.com/aweme/v1/play/?video_id=…&ratio=720p&line=0`
+       —— 实测 200 + 2.0~2.7MB 真 mp4。所以**首选 play_vid，这个只当兜底**。
+    """
     return pick_url(a.get("video") or {}, "play_addr", "play_addr_h264", "download_addr", "play_addr_265")
+
+
+def play_vid_of(a):
+    """
+    ⭐ 视频的 **vid**（`video.play_addr.uri`）—— 抽帧真正该用的那个。
+
+    为什么不直接用 play_addr 的 CDN 链接：那串 URL 带 `signature`/`expire`，
+    而且现在发的是 prime 节点，直接抓 403（原因见 play_of 的注释）。
+    `/aweme/v1/play/?video_id=<vid>` 由抖音自己 302 到可用的 CDN，**vid 长期有效**，
+    所以候选清单放一小时再抽帧也不会因为"链接过期"失败。
+    """
+    pa = (a.get("video") or {}).get("play_addr") or {}
+    uri = pa.get("uri") if isinstance(pa, dict) else None
+    return uri or ""
 
 
 def fmts(n):
@@ -230,9 +251,10 @@ def main():
             "share_desc": (si.get("share_link_desc") or "").replace("%s", official).strip(),
             # 网页地址（能在浏览器打开，但不是分享链接）
             "web_url": "%s/video/%s" % (BASE, aid),
-            # ⭐⭐ 2026-10-25：画面入口（tools/frames.py 只认这两样；删了就等于又没图看）
+            # ⭐⭐ 2026-10-25：画面入口（tools/frames.py 只认这几样；删了就等于又没图看）
             "cover_url": cover_of(a),
-            "play_url": play_of(a),
+            "play_vid": play_vid_of(a),      # ⭐ 抽帧首选：走 /aweme/v1/play/?video_id=
+            "play_url": play_of(a),          # 兜底（prime CDN 多半 403，别只留它）
         })
 
     rows.sort(key=lambda r: -r["score"])
