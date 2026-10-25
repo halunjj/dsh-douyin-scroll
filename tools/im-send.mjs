@@ -6,10 +6,10 @@
  * 我们只做三件事：点开会话 → 粘正文 → 回车。
  *
  * 用法：
- *   node tools/im-send.mjs --to 主示例好友主 --text 主你好主
- *   node tools/im-send.mjs --to 主示例好友主 --file <txt路径>
- *   node tools/im-send.mjs --to 主示例好友主 --file x.txt --dry   # 只验证不发送
- *   node tools/im-send.mjs --to 主示例好友主 --read               # 只读：把会话读出来（带「谁发的」）
+ *   node tools/im-send.mjs --to "示例好友" --text "你好"
+ *   node tools/im-send.mjs --to "示例好友" --file <txt路径>
+ *   node tools/im-send.mjs --to "示例好友" --file x.txt --dry   # 只验证不发送
+ *   node tools/im-send.mjs --to "示例好友" --read               # 只读：把会话读出来（带「谁发的」）
  *
  * 输出：一行 JSON
  *   发送：{ok, sent, to, len, readback, my_msg_before, my_msg_after, newest_from, msgs_sample, …}
@@ -68,14 +68,14 @@ const bodyText = async (ev) => (await ev(`(document.body?document.body.innerText
  */
 const readMessages = async (ev) => {
   const raw = await ev(`(function(){
-    var listNode = document.querySelector('[class*=主messageMessageList主]')
-      || document.querySelector('[class*=主componentsRightPanel主]') || document.body;
+    var listNode = document.querySelector('[class*="messageMessageList"]')
+      || document.querySelector('[class*="componentsRightPanel"]') || document.body;
     var lb = listNode.getBoundingClientRect();
     var mid = lb.left + lb.width / 2;
-    // ⚠️ 一条消息在 DOM 里有 3 层 class 都含 主messageMessageBox主（outer / selectableRow / contentBox），
+    // ⚠️ 一条消息在 DOM 里有 3 层 class 都含 "messageMessageBox"（outer / selectableRow / contentBox），
     //    直接 querySelectorAll 会**一条算三条** ⇒ 用 **对象引用** 去重（同一层消息被多个节点共享同一个
     //    message 对象）。别用位置去重：三层节点的 top 差几个像素，会漏掉。
-    var nodes = Array.prototype.slice.call(document.querySelectorAll('[class*=主messageMessageBox主]'));
+    var nodes = Array.prototype.slice.call(document.querySelectorAll('[class*="messageMessageBox"]'));
     var out = [], seenObj = new WeakSet();
     nodes.forEach(function(n){
       var fk = Object.keys(n).find(function(k){ return k.indexOf('__reactFiber$') === 0 });
@@ -120,7 +120,7 @@ const readMessages = async (ev) => {
 }
 
 const hasEditor = async (ev) => await ev(`(function(){
-  var eds=Array.prototype.slice.call(document.querySelectorAll('[contenteditable=主true主], textarea'));
+  var eds=Array.prototype.slice.call(document.querySelectorAll('[contenteditable="true"], textarea'));
   return eds.some(function(e){var r=e.getBoundingClientRect(); return r.width>80 && r.height>10;});
 })()`)
 
@@ -131,7 +131,7 @@ const hasEditor = async (ev) => await ev(`(function(){
  */
 const listConversations = (ev) => ev(`(function(){
   var out = [];
-  var nodes = Array.prototype.slice.call(document.querySelectorAll('[data-e2e=主conversation-item主]'));
+  var nodes = Array.prototype.slice.call(document.querySelectorAll('[data-e2e="conversation-item"]'));
   nodes.forEach(function(n){
     var fk = Object.keys(n).find(function(k){ return k.indexOf('__reactFiber$') === 0 });
     var sec = '';
@@ -159,7 +159,7 @@ const listConversations = (ev) => ev(`(function(){
      *    用「大肥鱼」当收件人（没有任何人叫这个名字），会匹配到 3 个人。
      *    这里给两个候选：昵称元素里的文本 → 没有就退回第一段。
      */
-    var nickEl = n.querySelector('[class*=主ConversationItemTitle主], [class*=主conversationItemTitle主], [class*=主nickname主], [class*=主Nickname主]');
+    var nickEl = n.querySelector('[class*="ConversationItemTitle"], [class*="conversationItemTitle"], [class*="conversationConversationItemtitle"], [class*="nickname"], [class*="Nickname"]');
     var nick = nickEl ? (nickEl.innerText || '').replace(/\\s+/g, ' ').trim() : '';
     if (!nick) nick = t.split(' ')[0] || '';
     /**
@@ -198,7 +198,7 @@ const listConversations = (ev) => ev(`(function(){
   return JSON.stringify(out);
 })()`)
 
-/** 从会话项文本里猜昵称（第一段；主示例好友 12:12 最后一句话主 → 主示例好友主） */
+/** 从会话项文本里猜昵称（第一段；主示例好友 12:12 最后一句话主 → "示例好友"） */
 const nickOf = (text) => String(text || '').split(/\s+/)[0] || ''
 
 /** 读「当前打开的这个会话」的对端 sec_uid —— 用来校验身份（不同层级包法不一样，多试几种） */
@@ -214,7 +214,7 @@ const currentConvId = (ev) => ev(`(function(){
     for (var i = 0; i < cands.length; i++) if (cands[i]) return String(cands[i]);
     return '';
   }
-  var node = document.querySelector('[class*=主messageMessageBox主]') || document.querySelector('[data-e2e=主msg-item-content主]');
+  var node = document.querySelector('[class*="messageMessageBox"]') || document.querySelector('[data-e2e="msg-item-content"]');
   if (!node) return '';
   var fk = Object.keys(node).find(function(k){ return k.indexOf('__reactFiber$') === 0 });
   if (!fk) return '';
@@ -245,7 +245,7 @@ async function waitList(ev, { timeoutMs = 15000, settleMs = 600 } = {}) {
   let last = 0
   let stable = 0
   while (Date.now() - t0 < timeoutMs) {
-    const n = Number(await ev(`document.querySelectorAll('[data-e2e=主conversation-item主]').length`)) || 0
+    const n = Number(await ev(`document.querySelectorAll('[data-e2e="conversation-item"]').length`)) || 0
     if (n > 0) {
       // 拿到之后就等它主不再变多主，避免只渲染了一部分就往下走
       if (n === last) stable++
@@ -297,12 +297,12 @@ async function waitList(ev, { timeoutMs = 15000, settleMs = 600 } = {}) {
 async function openConversation(ev, send, who, whoId) {
   /**
    * ⭐ 判断主当前会话是不是就是他主要用**右栏头部**，不是 bodyText。
-   *    右栏头部 = `[class*=主componentsRightPanel主]` 的第一行文本，那才是对端昵称。
+   *    右栏头部 = `[class*="componentsRightPanel"]` 的第一行文本，那才是对端昵称。
    *    （bodyText 含左侧列表，任何人都在里面 —— 那正是 bug ① 的根源）
    */
   const currentWho = async () => {
     const nick = String(await ev(`(function(){
-      var r = document.querySelector('[class*=主componentsRightPanel主]');
+      var r = document.querySelector('[class*="componentsRightPanel"]');
       if (!r) return '';
       var lines = (r.innerText || '').split('\\n').map(function(s){return s.trim()}).filter(Boolean);
       return lines.length ? lines[0] : '';
@@ -416,7 +416,7 @@ async function openConversation(ev, send, who, whoId) {
     const want = b.panel || 'main'
     // ① 切列表：目标在 main、但当前屏外 ⇒ 点「返回」箭头退出陌生人面板
     if (want === 'main') {
-      const hasStrangerTitle = await ev(`!!document.querySelector('[class*=主StrangerConversationListtitle主]')`)
+      const hasStrangerTitle = await ev(`!!document.querySelector('[class*="StrangerConversationListtitle"]')`)
       if (hasStrangerTitle) {
         const back = JSON.parse(String(await ev(`(function(){
           var best = null;
@@ -464,14 +464,14 @@ async function openConversation(ev, send, who, whoId) {
     const rescanned = JSON.parse(String(await ev(`(function(){
       var want = ${JSON.stringify(String(b.nick || ''))};
       var wantSec = ${JSON.stringify(String(b.sec_uid || ''))};
-      var nodes = Array.prototype.slice.call(document.querySelectorAll('[data-e2e=主conversation-item主]'));
+      var nodes = Array.prototype.slice.call(document.querySelectorAll('[data-e2e="conversation-item"]'));
       for (var i = 0; i < nodes.length; i++) {
         var n = nodes[i];
         var keys = Object.keys(n), fk = null;
         for (var k = 0; k < keys.length; k++) if (keys[k].indexOf('__reactFiber$') === 0) { fk = keys[k]; break }
         var sec = '';
         if (fk) { var f = n[fk], d = 0; while (f && d < 14) { var p = f.memoizedProps; if (p && p.conversation && p.conversation.toParticipantSecUserId) { sec = String(p.conversation.toParticipantSecUserId); break } f = f.return; d++; } }
-        var nickEl = n.querySelector('[class*=主ConversationItemTitle主], [class*=主conversationItemTitle主], [class*=主nickname主], [class*=主Nickname主]');
+        var nickEl = n.querySelector('[class*="ConversationItemTitle"], [class*="conversationItemTitle"], [class*="conversationConversationItemtitle"], [class*="nickname"], [class*="Nickname"]');
         var nk = nickEl ? (nickEl.innerText || '').replace(/\\s+/g, ' ').trim() : ((n.innerText || '').replace(/\\s+/g, ' ').trim().split(' ')[0] || '');
         if (wantSec ? sec !== wantSec : nk !== want) continue;
         var r = n.getBoundingClientRect();
@@ -659,7 +659,7 @@ async function main() {
      *    这一步很便宜（一次 evaluate），但它是主发错人主的最后一道闸。
      */
     const gateNick = String(await c.ev(`(function(){
-      var r = document.querySelector('[class*=主componentsRightPanel主]');
+      var r = document.querySelector('[class*="componentsRightPanel"]');
       if (!r) return '';
       var lines = (r.innerText || '').split('\\n').map(function(s){return s.trim()}).filter(Boolean);
       return lines.length ? lines[0] : '';
@@ -673,7 +673,7 @@ async function main() {
 
     // 点输入框
     const pos = JSON.parse(await c.ev(`(function(){
-      var eds=Array.prototype.slice.call(document.querySelectorAll('[contenteditable=主true主], textarea'));
+      var eds=Array.prototype.slice.call(document.querySelectorAll('[contenteditable="true"], textarea'));
       for (var i=0;i<eds.length;i++){var e=eds[i];var r=e.getBoundingClientRect();if(r.width>80&&r.height>10)return JSON.stringify({x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)});}
       return '{}';
     })()`))
@@ -684,7 +684,7 @@ async function main() {
     await sleep(800)
 
     const typed = await c.ev(`(function(){
-      var e=document.querySelector('[contenteditable=主true主], textarea');
+      var e=document.querySelector('[contenteditable="true"], textarea');
       return e ? String(e.innerText||e.value||'').replace(/[\\u200b\\r]/g,'') : '';
     })()`)
     if (!String(typed).trim()) return out({ ok: false, error: '正文没进输入框（可能被风控拦截）', chrome: chromed })
@@ -695,7 +695,7 @@ async function main() {
 
     const bodyNow = await bodyText(c.ev)
     const leftInBox = await c.ev(`(function(){
-      var e=document.querySelector('[contenteditable=主true主], textarea');
+      var e=document.querySelector('[contenteditable="true"], textarea');
       return (e?String(e.innerText||e.value||''):'').replace(/[\\u200b\\s]/g,'').length;
     })()`)
     // ⭐ 第 ③ 步：**回读消息列表**，而且只数 `from === 'me'` 的
