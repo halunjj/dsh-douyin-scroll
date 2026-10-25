@@ -317,10 +317,15 @@ const TOOLS = [
       const r = runPy('api-comments.py', [id], 300_000)
       const lines = String(r.stdout || '').split('\n')
       const items = lines.filter((l) => /^\s{2}cid=|^\s{6}└ /.test(l)).map((s) => s.replace(/^\s+/, ''))
-      if (r.status !== 0) return { ok: false, error: '拉评论失败', stderr: String(r.stderr || '').slice(0, 300) }
+      // 🔴 2026-10-25：签名器那条路走不通时 api-comments.py 会退到「评论区 DOM」，并在
+      // stdout 里写一行 `via=dom …`。如实把来路带出来 —— 也提醒用的人：这些文本来自页面
+      // DOM，**没有真 cid**（占位是 dom:N，别拿它去回复/删除）。
+      const via = /^via=dom/m.test(String(r.stdout || '')) ? 'dom' : 'api'
+      if (r.status !== 0) return { ok: false, error: '拉评论失败', via, stderr: String(r.stderr || '').slice(0, 300) }
       return {
         ok: true,
         aweme_id: id,
+        via,
         count: items.filter((s) => s.startsWith('cid=')).length,
         comments: items,
       }

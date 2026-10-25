@@ -81,9 +81,14 @@ def dom_fallback(aweme):
         print(json.dumps({"ok": False, "err": j.get("error") or "DOM 读取失败", "via": "dom"}, ensure_ascii=False))
         return 1
     items = j.get("items") or []
-    print("via=dom me=%s 抓到=%s 条" % (j.get("me_nick") or "", j.get("total_scraped")))
-    for it in items:
-        print("  %s%s: %s" % ("[我] " if it.get("mine") else "", it.get("nick") or "", (it.get("text") or "")[:110]))
+    print("via=dom me=%s 抓到=%s 条（DOM 里没有 cid ⇒ 用 dom:N 占位，别拿它去回复）"
+          % (j.get("me_nick") or "", j.get("total_scraped")))
+    for n, it in enumerate(items, 1):
+        # ⚠️ 输出形状必须跟 api 那条路一致：mcp-server.mjs 的 douyin_comments 只认
+        #    `  cid=` 开头的行（第 319 行的 regex）。以前这里打成「昵称: 文本」，
+        #    结果工具明明拿到了 33 条文本，却报 count: 0 —— 静默空，比报错还坑。
+        tag = "我" if it.get("mine") else "他"
+        print("  cid=dom:%d  %s [%s]  %s" % (n, it.get("nick") or "", tag, (it.get("text") or "")[:110]))
     return 0
 
 
