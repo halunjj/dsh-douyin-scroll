@@ -45,7 +45,14 @@ const HOME = homeDir()
  *    端口没人监听：登录窗报「登录用的浏览器还没开」，无头报「9334 上连不上 CDP」。
  *    ⚠️ 搬的必须是**登录窗口**：无头换新 profile 会被抖音风控（「验证码中间页」）。
  */
-const PROFILE = loginProfileDir()
+// ⭐ 2026-10-25 晚：扫码时**可以指定要登进哪个 profile**（QR_PROFILE_DIR，绝对路径）。
+//    为什么需要它：真正干活的是**采集器那个暖 profile**（chrome-profile）—— 发卡片、
+//    点 @、读会话这些走浏览器 UI 的工具用的都是它。可这里的 PROFILE 原来固定写
+//    login-profile ⇒ 扫进来的号只落进 cookie 文件（HTTP 那半），浏览器那半还是旧号
+//    ⇒ **身份劈成两半**。本机实测到过：cookie/whoami = 洛茜，浏览器 = 哈伦JJ，
+//    于是卡片发到了插件自己另一个号上、真 @ 变成了 @ 自己（抖音不给自 @ 发通知）。
+//    ⚠️ 别直接给采集器换**新** profile（会吃风控，见上），只能把登录**做进那个暖 profile**。
+const PROFILE = process.env.QR_PROFILE_DIR || loginProfileDir()
 /**
  * ⭐ 端口不再写死 9333：那会和"别的东西恰好占了 9333"冲突，而且 9333 不在
  *    lib/chrome.mjs 的扫描范围（9334–9373）里，两个模块各扫各的，谁也不认识谁。
